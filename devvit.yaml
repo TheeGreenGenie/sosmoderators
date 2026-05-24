@@ -1,0 +1,8 @@
+name: sosmoderators
+version: 0.1.0
+
+permissions:
+  - name: posts
+  - name: privatemessages
+  - name: flair
+  - name: modposts
