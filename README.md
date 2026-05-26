@@ -2,6 +2,8 @@
 
 SubGuardian is an automated moderation assistant for Reddit subreddits. It handles spam filtering, trust scoring, flair management, and community tools — all from a dashboard inside your subreddit. New mods get an AI co-pilot that answers questions about their own sub's data. Veteran mods get precise controls without having to write AutoMod rules from scratch.
 
+> **Access control:** Only subreddit moderators can open the Dashboard or Config UI. Non-mods see an access-denied screen.
+
 ---
 
 ## What SubGuardian Does
@@ -33,6 +35,8 @@ Every user in your subreddit gets a trust score from 0–1000. The score updates
 
 Trust goes up through approved posts, account age, subreddit karma, helpful reports, awards, and top posts. It goes down through removed posts, actioned reports against the user, and bans.
 
+The **Trust Leaderboard** in the dashboard shows the top contributors in a compact 2-column layout with tier badges and medals for the top 3 positions.
+
 ### Contextual Why-Removed PMs
 
 When a post is flagged or removed, the author receives a PM that names the exact signals that triggered it, shows the spam score vs. your threshold, and gives a concrete suggestion for how to fix the post. It ends with `!recheck` instructions. No generic "your post was removed" messages.
@@ -52,6 +56,12 @@ The Coach tab inside the dashboard lets any mod ask plain-English questions abou
 Six quick-answer chips cover the most common questions so mods don't need to type anything. The "Ask a question..." button opens a free-text form for anything else.
 
 Coach works without any LLM configuration — the heuristic mode reads your Redis data and gives grounded, specific answers. If you configure an LLM API key and endpoint in the Config UI, Coach switches to LLM mode for free-form questions.
+
+### Topic Intelligence
+
+The Posts tab surfaces the topics your community actually posts about, derived from post titles. SubGuardian strips stop words, Reddit meta-words (post, thread, comment, flair, etc.), and generic filler words, then applies suffix stemming so "testing" and "test" are counted as the same word. Topics are displayed as a ranked frequency bar chart. The section is collapsible so you can always see flair suggestions below it.
+
+The aggregate builder job runs every 15 minutes and selectively prunes any previously stored words that no longer pass the filter — without wiping valid topic counts.
 
 ### Shadow-Audit Mode
 
@@ -119,10 +129,12 @@ Open the dashboard from the subreddit menu: **SubGuardian: Open Dashboard**
 |-----|-----------------|
 | Overview | Today's post/removal/flag counts, 7-day averages, system status |
 | Pending Review | Flagged posts — click any to open the full Case File |
-| Posts | Top upvoted posts this week; content interest topics |
-| Leaderboard | All-time and weekly contribution rankings |
+| Posts | Top 10 posts this week in a 2-column grid; collapsible topic chart; flair suggestions |
+| Leaderboard | All-time and weekly contribution rankings in a compact 2-column layout |
 | Audit Log | Recent moderation actions taken by SubGuardian |
 | Coach | AI co-pilot — ask anything about your sub's data |
+
+The Dashboard post recreates itself automatically if it is ever deleted or removed from the subreddit.
 
 ---
 
@@ -133,12 +145,12 @@ Open from the subreddit menu: **SubGuardian: Open Config**
 | Section | What you can configure |
 |---------|----------------------|
 | Presets | Apply a Default, Strict, or Raid configuration bundle in one click |
-| Features | Toggle spam detection, report handling, anti-raid, ban evasion, flair pipeline, post rate limiting individually |
-| Thresholds | Auto-remove threshold, auto-flag threshold, minimum trust to vote on flairs, shadow-test threshold |
-| Spam Keywords | Add and remove banned keywords; toggle any keyword into Shadow-Audit test mode |
+| Features | Toggle spam detection, report handling, anti-raid, ban evasion, flair pipeline, and post rate limiting — displayed in a 3-column grid |
+| Thresholds | Collapsible sections for detection thresholds, spam keywords, flair voting, and quiet hours |
 | Anti-Raid Gates | Enable/disable and tune each gate (account age, karma, trust score, posts per day) |
-| Quiet Hours | Enable and set the UTC window for suppressing non-critical modmail |
 | Danger Zone | Kill switch (pauses all automated actions), config reset |
+
+The Config post recreates itself automatically if it is ever deleted or removed from the subreddit.
 
 ---
 
