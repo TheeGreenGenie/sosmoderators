@@ -1,5 +1,7 @@
 import type { ScheduledJobEvent, JobContext } from '@devvit/public-api';
 import { Keys, dateKey, weekKey } from '../redis/schema.js';
+import type { ShadowAuditEntry } from '../redis/schema.js';
+import { getConfig, setConfig } from '../redis/config.js';
 
 const STOP_WORDS = new Set([
   'a','an','the','and','or','but','in','on','at','to','for','of','with',
@@ -118,7 +120,89 @@ export async function runAggregateBuilder(
     console.log(`[AggregateBuilder] top posts fetch failed (may need App Review for reddit API in jobs)`);
   }
 
+  // Shadow-Audit digest: send modmail report once 24h after shadow mode started
+  await runShadowAuditDigest(context);
+
   // Record job completion timestamp
   await redis.set('agg:last_built', String(Date.now()));
   console.log(`[AggregateBuilder] done — 7d avg posts=${Math.round(sevenDayTotals.total / 7)}`);
+}
+
+const SHADOW_DIGEST_INTERVAL_MS = 24 * 3_600_000; // 24 hours
+
+async function runShadowAuditDigest(context: JobContext): Promise<void> {
+  const redis = context.redis;
+  const config = await getConfig(redis);
+  const shadowKeywords = config.shadowAudit?.keywords ?? [];
+  const startedAt = config.shadowAudit?.startedAt ?? null;
+
+  if (shadowKeywords.length === 0 || startedAt === null) return;
+
+  const now = Date.now();
+  if (now - startedAt < SHADOW_DIGEST_INTERVAL_MS) return; // not 24h yet
+
+  const subredditName = context.subredditName ?? '';
+  const digestLines: string[] = [
+    `## Shadow-Audit Digest — r/${subredditName}`,
+    ``,
+    `Shadow mode has been running for ${Math.round((now - startedAt) / 3_600_000)}h.`,
+    ``,
+  ];
+
+  let anyNewDigests = false;
+
+  for (const kw of shadowKeywords) {
+    const digestSentKey = Keys.shadowAuditDigestSent(kw);
+    const lastSentRaw = await redis.get(digestSentKey);
+    const lastSent = lastSentRaw ? parseInt(lastSentRaw) : 0;
+
+    // Only send if no digest has been sent since this shadow run started
+    if (lastSent >= startedAt) continue;
+
+    const listKey = Keys.shadowAuditList(kw);
+    const count = await redis.zCard(listKey);
+
+    if (count === 0) {
+      digestLines.push(`**"${kw}"** — caught 0 posts in the last 24h.`);
+    } else {
+      const rawMembers = await redis.zRange(listKey, 0, count - 1, { by: 'rank', reverse: true });
+      const entries: ShadowAuditEntry[] = rawMembers.flatMap(({ member }) => {
+        try {
+          const { _u: _, ...entry } = JSON.parse(member) as ShadowAuditEntry & { _u: string };
+          return [entry];
+        } catch {
+          return [];
+        }
+      });
+
+      const samples = entries.slice(0, 5);
+      digestLines.push(`**"${kw}"** — would have caught **${count}** post${count !== 1 ? 's' : ''} in the last 24h:`);
+      for (const s of samples) {
+        digestLines.push(`  • "${s.title}" (score: ${s.score.toFixed(2)})`);
+      }
+    }
+
+    digestLines.push(
+      ``,
+      `To activate this rule now, reply: \`!shadow-activate ${kw}\``,
+      ``,
+    );
+
+    await redis.set(digestSentKey, String(now));
+    anyNewDigests = true;
+  }
+
+  if (!anyNewDigests) return;
+
+  try {
+    await context.reddit.modMail.createConversation({
+      subredditName,
+      subject: `SubGuardian Shadow-Audit Report — ${new Date().toDateString()}`,
+      body: digestLines.join('\n'),
+      isAuthorHidden: false,
+    });
+    console.log(`[ShadowAudit] digest sent for ${subredditName} — keywords: ${shadowKeywords.join(', ')}`);
+  } catch (e) {
+    console.log(`[ShadowAudit] digest modmail failed: ${e}`);
+  }
 }

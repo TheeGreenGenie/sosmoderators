@@ -12,8 +12,10 @@ import { extractUrls, extractDomain } from '../utils/regex.js';
 import { removePost, flairPost, sendModAlert } from '../moderation/actions.js';
 import { getAIProvider } from '../ai/interface.js';
 import { FLAIR_CONFIDENCE, TRUST } from '../utils/constants.js';
-import type { ActivityCounters, FlairSuggestion } from '../redis/schema.js';
+import type { ActivityCounters, FlairSuggestion, PostMeta, RecoveryRecord, ShadowAuditEntry, SpamScore } from '../redis/schema.js';
 import { Keys, weekKey } from '../redis/schema.js';
+import { formatWhyRemovedPM, signalLabel, signalFix } from '../utils/pmTemplates.js';
+import { logAction } from '../moderation/auditLog.js';
 
 export async function onPostSubmit(event: TriggerEventType['PostSubmit'], context: TriggerContext): Promise<void> {
   const redis = context.redis;
@@ -39,11 +41,23 @@ export async function onPostSubmit(event: TriggerEventType['PostSubmit'], contex
   }
 
   const userId = author.id ?? '';
+  const postId = post.id ?? '';
 
   // Always overwrite so renames are picked up immediately
   if (userId && author.name) {
     await redis.set(Keys.userUsername(userId), author.name);
   }
+
+  await cachePostMeta(redis, {
+    postId,
+    title: post.title ?? '',
+    selftext: post.selftext ?? '',
+    url: post.url ?? null,
+    authorId: userId,
+    authorName: author.name ?? '',
+    permalink: post.permalink ?? '',
+    createdAt: Date.now(),
+  });
 
   // Fetch / initialize user state
   let trustRecord = await getTrustScore(redis, userId);
@@ -170,22 +184,48 @@ export async function onPostSubmit(event: TriggerEventType['PostSubmit'], contex
   };
 
   const spamScore = computeSpamScore(spamInput, config);
-  await setSpamScore(redis, post.id ?? '', spamScore);
+  await setSpamScore(redis, postId, spamScore);
   console.log(`[PostSubmit] spam score=${spamScore.score.toFixed(2)} signals=${spamScore.signals.join(',')}`);
+
+  // Shadow-Audit: scan for shadow keywords independently of live banned keywords
+  await checkShadowAudit(redis, postId, post.title ?? '', post.selftext ?? '', spamScore.score, config.shadowAudit.keywords);
+  await checkShadowThreshold(redis, postId, post.title ?? '', spamScore.score, config);
 
   const spamAction = getSpamAction(spamScore.score, config, spamScore.signals);
   console.log(`[PostSubmit] action=${spamAction}`);
+  const isFirstOffense = activity.removedPosts === 0 && activity.actionedReportsAgainst === 0;
+  // Only offer recovery for signals the author can actually fix by editing the body.
+  // Title signals (url_in_title, excessive_caps, etc.) cannot be changed after submission.
+  const BODY_FIXABLE = new Set(['selftext_duplicate', 'domain_banned', 'banned_keyword', 'high_url_density']);
+  const hasFixableSignal = spamScore.signals.some((s) => BODY_FIXABLE.has(s));
 
   if (spamAction === 'remove') {
+    const reason = `Spam score ${spamScore.score.toFixed(2)}: ${spamScore.signals.join(', ')}`;
     await removePost({
       context,
       redis,
-      targetId: post.id ?? '',
+      targetId: postId,
       targetType: 'post',
-      actor: 'SubGuardian:spam',
-      reason: `Spam score ${spamScore.score.toFixed(2)}: ${spamScore.signals.join(', ')}`,
+      actor: isFirstOffense ? 'SubGuardian:recovery' : 'SubGuardian:spam',
+      reason,
       score: spamScore.score,
     });
+    await recordFlaggedPost(redis, postId, post.title ?? '', spamScore);
+    await sendContextualPM(context, redis, postId, userId, author.name ?? '', post.title ?? '', spamScore, config, hasFixableSignal);
+    if (isFirstOffense && hasFixableSignal) {
+      await startRecoveryWindow(redis, postId, userId, author.name ?? '', spamScore.score);
+      await incrementPostAgg(redis, 'flagged');
+      await logAction(redis, {
+        timestamp: Date.now(),
+        action: 'recovery_started',
+        targetId: postId,
+        targetType: 'post',
+        actor: 'SubGuardian',
+        reason,
+        score: spamScore.score,
+      });
+      return;
+    }
     await incrementPostAgg(redis, 'removed');
     const updated = await updateActivity(redis, userId, { removedPosts: activity.removedPosts + 1 });
     await recomputeTrust(redis, userId, updated, await isInGrace(redis, userId));
@@ -198,39 +238,15 @@ export async function onPostSubmit(event: TriggerEventType['PostSubmit'], contex
     await flairPost({
       context,
       redis,
-      targetId: post.id ?? '',
+      targetId: postId,
       targetType: 'post',
       actor: 'SubGuardian:spam',
       reason: flagReason,
       flairText: '⚠️ Needs Review',
     });
-    await removePost({
-      context,
-      redis,
-      targetId: post.id ?? '',
-      targetType: 'post',
-      actor: 'SubGuardian:spam',
-      reason: flagReason,
-      score: spamScore.score,
-    });
     const authorName = author.name ?? '';
-    if (authorName) {
-      try {
-        await context.reddit.sendPrivateMessage({
-          to: authorName,
-          subject: `Your post on r/${context.subredditName ?? ''} has been held for review`,
-          text: [
-            `Hi u/${authorName},`,
-            ``,
-            `Your post **"${post.title ?? ''}"** has been flagged by our automated moderation system and temporarily removed from the feed pending review.`,
-            ``,
-            `A moderator will review it shortly. If approved, it will reappear automatically. No action is needed on your part.`,
-            ``,
-            `*This is an automated message from SubGuardian.*`,
-          ].join('\n'),
-        });
-      } catch { /* DMs disabled — skip silently */ }
-    }
+    await sendContextualPM(context, redis, postId, userId, authorName, post.title ?? '', spamScore, config, hasFixableSignal);
+    await postModCaseBrief(context, post.id ?? '', post.title ?? '', authorName, spamScore, trustRecord, activity, isFirstOffense && hasFixableSignal, config);
     // Record in flagged posts list for dashboard (capped at 50, 7-day TTL)
     const flaggedKey = 'dashboard:flagged_posts';
     const flaggedRaw = await redis.get(flaggedKey);
@@ -239,7 +255,20 @@ export async function onPostSubmit(event: TriggerEventType['PostSubmit'], contex
     flaggedList.unshift({ id: post.id ?? '', title: (post.title ?? '').slice(0, 80), spamScore: spamScore.score, reportCount: 0, score: 0, signals: spamScore.signals });
     if (flaggedList.length > 50) flaggedList.length = 50;
     await redis.set(flaggedKey, JSON.stringify(flaggedList), { expiration: new Date(Date.now() + 7 * 86_400 * 1000) });
-    await applyTrustPenalty(redis, userId, 30);
+    if (isFirstOffense && hasFixableSignal) {
+      await startRecoveryWindow(redis, postId, userId, authorName, spamScore.score);
+      await logAction(redis, {
+        timestamp: Date.now(),
+        action: 'recovery_started',
+        targetId: postId,
+        targetType: 'post',
+        actor: 'SubGuardian',
+        reason: flagReason,
+        score: spamScore.score,
+      });
+    } else {
+      await applyTrustPenalty(redis, userId, 30);
+    }
     console.log(`[PostSubmit] flagged, held, and author notified — postId=${post.id ?? ''}`);
     await incrementPostAgg(redis, 'flagged');
     spamFlagged = true;
@@ -423,6 +452,81 @@ export async function onPostSubmit(event: TriggerEventType['PostSubmit'], contex
   await incrementHourlyPost(redis);
 }
 
+async function cachePostMeta(
+  redis: import('@devvit/public-api').RedisClient,
+  meta: PostMeta,
+): Promise<void> {
+  if (!meta.postId) return;
+  await redis.set(Keys.postMeta(meta.postId), JSON.stringify(meta), {
+    expiration: new Date(Date.now() + 30 * 86_400_000),
+  });
+}
+
+async function recordFlaggedPost(
+  redis: import('@devvit/public-api').RedisClient,
+  postId: string,
+  title: string,
+  spamScore: SpamScore,
+): Promise<void> {
+  const flaggedKey = 'dashboard:flagged_posts';
+  const flaggedRaw = await redis.get(flaggedKey);
+  const flaggedList: Array<{ id: string; title: string; spamScore: number; reportCount: number; score: number; signals: string[]; recovery?: boolean }> =
+    flaggedRaw ? (JSON.parse(flaggedRaw) as Array<{ id: string; title: string; spamScore: number; reportCount: number; score: number; signals: string[]; recovery?: boolean }>) : [];
+  flaggedList.unshift({ id: postId, title: title.slice(0, 80), spamScore: spamScore.score, reportCount: 0, score: 0, signals: spamScore.signals });
+  const deduped = flaggedList.filter((item, index, all) => all.findIndex((other) => other.id === item.id) === index);
+  if (deduped.length > 50) deduped.length = 50;
+  await redis.set(flaggedKey, JSON.stringify(deduped), { expiration: new Date(Date.now() + 7 * 86_400_000) });
+}
+
+async function startRecoveryWindow(
+  redis: import('@devvit/public-api').RedisClient,
+  postId: string,
+  userId: string,
+  username: string,
+  originalScore: number,
+): Promise<void> {
+  const record: RecoveryRecord = {
+    userId,
+    username,
+    originalScore,
+    expiresAt: Date.now() + 86_400_000,
+  };
+  await redis.set(Keys.postRecovery(postId), JSON.stringify(record), {
+    expiration: new Date(Date.now() + 25 * 3_600_000),
+  });
+}
+
+async function sendContextualPM(
+  context: TriggerContext,
+  redis: import('@devvit/public-api').RedisClient,
+  postId: string,
+  userId: string,
+  authorName: string,
+  title: string,
+  spamScore: SpamScore,
+  config: import('../redis/schema.js').SubConfig,
+  includeRecheck = true,
+): Promise<void> {
+  if (!authorName) return;
+  await Promise.all([
+    redis.set(Keys.postRecheckUser(userId || authorName), postId, {
+      expiration: new Date(Date.now() + 7 * 86_400_000),
+    }),
+    redis.set(Keys.postRecheckUser(authorName), postId, {
+      expiration: new Date(Date.now() + 7 * 86_400_000),
+    }),
+  ]);
+  try {
+    await context.reddit.sendPrivateMessage({
+      to: authorName,
+      subject: `Your post on r/${context.subredditName ?? ''} has been held for review`,
+      text: formatWhyRemovedPM(spamScore, config, authorName, title, context.subredditName ?? '', includeRecheck),
+    });
+  } catch {
+    // DMs disabled - skip silently.
+  }
+}
+
 async function antiRaidCheck(
   userId: string,
   author: { karma?: number; accountAgeDays?: number },
@@ -484,6 +588,128 @@ async function applyTrustPenalty(
   await redis.set(Keys.userTrust(userId), JSON.stringify({ ...trust, score: newScore, tier, lastUpdated: Date.now() }));
   await redis.zAdd(Keys.leaderboardTrust, { score: newScore, member: userId });
   console.log(`[applyTrustPenalty] userId=${userId} -${points} => ${newScore} (${tier})`);
+}
+
+async function postModCaseBrief(
+  context: TriggerContext,
+  postId: string,
+  title: string,
+  authorName: string,
+  spamScore: SpamScore,
+  trustRecord: import('../redis/schema.js').TrustScore | null,
+  activity: ActivityCounters,
+  isFirstOffense: boolean,
+  config: import('../redis/schema.js').SubConfig,
+): Promise<void> {
+  const verdict = isFirstOffense && spamScore.score < 0.70
+    ? 'APPROVE — first offense, score below strong-remove threshold'
+    : spamScore.score >= config.spamDetection.autoRemoveThreshold
+      ? 'REMOVE — score above auto-remove threshold'
+      : activity.removedPosts >= 2
+        ? 'REMOVE — repeat prior removals'
+        : 'APPROVE — borderline score, no strong repeat-offender signal';
+
+  const signalLines = spamScore.signals
+    .map((s) => `- **${signalLabel(s)}** — ${signalFix(s)}`)
+    .join('\n');
+
+  const subName = context.subredditName ?? '';
+  const postUrl = `https://reddit.com/r/${subName}/comments/${postId.replace('t3_', '')}`;
+
+  const mailBody = [
+    `**Case Brief — flagged post in r/${subName}**`,
+    ``,
+    `**Post:** [${title.slice(0, 80)}](${postUrl})`,
+    `**Author:** u/${authorName} | Trust: ${trustRecord?.score ?? 300} (${trustRecord?.tier ?? 'neutral'})`,
+    ``,
+    `**Why flagged** (score: ${spamScore.score.toFixed(2)} | flag threshold: ${config.spamDetection.autoFlagThreshold.toFixed(2)}):`,
+    signalLines || '- No specific signals recorded',
+    ``,
+    `**Author history in r/${subName}:**`,
+    `- ${activity.approvedSubPosts} approved posts`,
+    `- ${activity.removedPosts} prior removals`,
+    `- ${activity.actionedReportsAgainst} actioned reports against them`,
+    isFirstOffense ? `\n**First offense** — Recovery PM sent. Author has 24 h to edit and reply !recheck.` : '',
+    ``,
+    `**SubGuardian suggests: ${verdict}**`,
+  ].filter((l) => l !== undefined).join('\n');
+
+  const commentTargetId = postId.startsWith('t3_') ? postId : `t3_${postId}`;
+  let mailUrl = 'https://mod.reddit.com/mail/all';
+
+  try {
+    const result = await context.reddit.modMail.createConversation({
+      subredditName: subName,
+      subject: `[SubGuardian] Flagged post: "${title.slice(0, 60)}"`,
+      body: mailBody,
+      isAuthorHidden: false,
+    });
+    const convId: string = (result as { conversation?: { id?: string } }).conversation?.id ?? '';
+    if (convId) mailUrl = `https://mod.reddit.com/mail/all/${convId}`;
+    console.log(`[PostSubmit] mod case brief modmail sent — convId=${convId}`);
+  } catch (e) {
+    console.log(`[PostSubmit] mod case brief modmail failed — ${String(e)}`);
+  }
+
+  const commentText = `**[SubGuardian]** This post has been flagged for mod review. [View case brief in Modmail](${mailUrl})`;
+
+  try {
+    const comment = await context.reddit.submitComment({ id: commentTargetId, text: commentText });
+    await comment.distinguish(true);
+  } catch (e) {
+    console.log(`[PostSubmit] mod case brief comment failed — ${String(e)}`);
+  }
+}
+
+async function checkShadowAudit(
+  redis: import('@devvit/public-api').RedisClient,
+  postId: string,
+  title: string,
+  selftext: string,
+  spamScore: number,
+  shadowKeywords: string[],
+): Promise<void> {
+  if (shadowKeywords.length === 0) return;
+  const content = (title + ' ' + selftext).toLowerCase();
+  const now = Date.now();
+  for (const kw of shadowKeywords) {
+    if (!content.includes(kw.toLowerCase())) continue;
+    const entry: ShadowAuditEntry = {
+      postId,
+      title: title.slice(0, 120),
+      score: spamScore,
+      matchedKeyword: kw,
+      timestamp: now,
+    };
+    const listKey = Keys.shadowAuditList(kw);
+    // Store as sorted set: score=timestamp, member=JSON (unique suffix avoids duplicate member error)
+    await redis.zAdd(listKey, { score: now, member: JSON.stringify({ ...entry, _u: postId }) });
+    // Trim to 200 entries: remove entries older than 25h (shadow window + buffer)
+    await redis.zRemRangeByScore(listKey, 0, now - 25 * 3_600_000);
+    console.log(`[ShadowAudit] keyword="${kw}" matched postId=${postId} score=${spamScore.toFixed(2)}`);
+  }
+}
+
+async function checkShadowThreshold(
+  redis: import('@devvit/public-api').RedisClient,
+  postId: string,
+  title: string,
+  spamScore: number,
+  config: import('../redis/schema.js').SubConfig,
+): Promise<void> {
+  if (!config.shadowAudit.thresholdTestActive) return;
+  const candidate = config.shadowAudit.thresholdTestValue;
+  if (spamScore < candidate || spamScore >= config.spamDetection.autoFlagThreshold) return;
+  const entry: ShadowAuditEntry = {
+    postId,
+    title: title.slice(0, 120),
+    score: spamScore,
+    matchedKeyword: `threshold:${candidate.toFixed(2)}`,
+    timestamp: Date.now(),
+  };
+  const listKey = Keys.shadowAuditList(`threshold:${candidate.toFixed(2)}`);
+  await redis.zAdd(listKey, { score: entry.timestamp, member: JSON.stringify({ ...entry, _u: postId }) });
+  await redis.zRemRangeByScore(listKey, 0, Date.now() - 25 * 3_600_000);
 }
 
 async function recomputeTrust(

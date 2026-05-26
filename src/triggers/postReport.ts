@@ -74,6 +74,8 @@ export async function onPostReport(event: TriggerEventType['PostReport'], contex
         '',
         'Auto-action suppressed. Please review manually.',
       ].join('\n')
+      ,
+      true
     );
     return;
   }

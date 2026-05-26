@@ -56,6 +56,8 @@ async function checkPostSpike(
         `**Baseline average:** ${avg.toFixed(1)}`,
         `**Threshold (${SPIKE_ALERT_MULTIPLIER}x):** ${threshold.toFixed(1)}`,
         `**Time:** ${now.toUTCString()}`,
+        '',
+        'Reply with !raid to activate Raid preset immediately.',
       ].join('\n')
     );
     await redis.set(alertKey, '1', { expiration: new Date(Date.now() + 3600 * 1000) });
@@ -110,6 +112,8 @@ async function checkToxicitySpike(
         `**Time:** ${now.toUTCString()}`,
         '',
         'Review recent comments for coordinated harassment.',
+        '',
+        'Reply with !raid to activate Raid preset immediately.',
       ].join('\n')
     );
     await redis.set(alertKey, '1', { expiration: new Date(Date.now() + 3600 * 1000) });

@@ -26,71 +26,96 @@ export function ContentInterests({
   onAddFlair,
   onPutToVote,
 }: ContentInterestsProps): JSX.Element {
-  const visible = topics
-    .filter((t) => !dismissedTopics.includes(t.topic))
-    .slice(0, 10);
+  const visible = topics.filter((t) => !dismissedTopics.includes(t.topic)).slice(0, 10);
+  const maxCount = visible.length > 0 ? Math.max(...visible.map((t) => t.count)) : 1;
 
   return (
-    <vstack gap="small" padding="medium">
-      <hstack alignment="start middle">
-        <text size="xlarge" weight="bold" grow>Top Topics (7d)</text>
-        <button size="small" appearance="secondary" onPress={onToggleMinimize}>
-          {topicsMinimized ? '▼ Show' : '▲ Hide'}
-        </button>
-      </hstack>
-      {!topicsMinimized && visible.length === 0 && (
-        <text color="neutral-content-weak">No topic data yet.</text>
-      )}
-      {!topicsMinimized && visible.map((t) => (
-        <hstack key={t.topic} alignment="start middle" gap="small">
-          <text grow>{t.topic}</text>
-          <hstack
-            backgroundColor="#0079d3"
-            height="12px"
-            width={`${Math.min(t.count * 4, 200)}px`}
-            cornerRadius="small"
-          />
-          <text width="40px" alignment="end middle" size="small">
-            {t.count}
-          </text>
-          <button size="small" appearance="secondary" onPress={() => onDismiss(t.topic)}>✕</button>
-        </hstack>
-      ))}
+    <vstack gap="medium" padding="medium">
 
+      {/* Topics section */}
+      <vstack gap="small">
+        <hstack alignment="start middle">
+          <text size="xlarge" weight="bold" grow>Top Topics</text>
+          <text size="small" color="neutral-content-weak">7-day window  </text>
+          <button size="small" appearance="secondary" onPress={onToggleMinimize}>
+            {topicsMinimized ? 'Show' : 'Hide'}
+          </button>
+        </hstack>
+
+        {!topicsMinimized && visible.length === 0 && (
+          <vstack
+            backgroundColor="neutral-background"
+            padding="medium"
+            cornerRadius="medium"
+            alignment="center middle"
+            gap="small"
+          >
+            <text color="neutral-content-weak">No topic data yet.</text>
+            <text size="small" color="neutral-content-weak">Topics appear after the aggregate builder runs.</text>
+          </vstack>
+        )}
+
+        {!topicsMinimized && visible.map((t) => {
+          const barPx = `${Math.max(8, Math.round((t.count / maxCount) * 160))}px` as `${number}px`;
+          return (
+            <hstack
+              key={t.topic}
+              backgroundColor="neutral-background"
+              padding="small"
+              cornerRadius="medium"
+              alignment="start middle"
+              gap="small"
+            >
+              <text grow size="small" weight="bold">{t.topic}</text>
+              <hstack
+                height="8px"
+                width={barPx}
+                backgroundColor="#0079d3"
+                cornerRadius="full"
+              />
+              <text size="small" color="neutral-content-weak" width="28px" alignment="end middle">
+                {t.count}
+              </text>
+              <button size="small" appearance="secondary" onPress={() => onDismiss(t.topic)}>✕</button>
+            </hstack>
+          );
+        })}
+      </vstack>
+
+      {/* Flair suggestions */}
       {flairSuggestions.length > 0 && (
         <vstack gap="small">
-          <text size="large" weight="bold">Suggest New Flair</text>
-          <text size="small" color="neutral-content-weak">
-            These trending topics have no matching flair yet.
-          </text>
+          <vstack gap="small">
+            <text size="large" weight="bold">New Flair Suggestions</text>
+            <text size="small" color="neutral-content-weak">
+              Trending topics with no matching flair yet.
+            </text>
+          </vstack>
+
           {flairSuggestions.map((topic) => (
             <hstack
               key={topic}
               backgroundColor="neutral-background"
-              padding="small"
-              cornerRadius="small"
+              padding="medium"
+              cornerRadius="medium"
               alignment="start middle"
               gap="small"
             >
-              <text grow size="small" weight="bold">{topic}</text>
-              <button
-                size="small"
-                appearance="primary"
-                onPress={() => onAddFlair(topic)}
-              >
-                Add Directly
+              <vstack grow gap="small">
+                <text weight="bold">{topic}</text>
+                <text size="small" color="neutral-content-weak">Trending this week</text>
+              </vstack>
+              <button size="small" appearance="secondary" onPress={() => onPutToVote(topic)}>
+                Vote
               </button>
-              <button
-                size="small"
-                appearance="secondary"
-                onPress={() => onPutToVote(topic)}
-              >
-                Put to Vote
+              <button size="small" appearance="primary" onPress={() => onAddFlair(topic)}>
+                Add
               </button>
             </hstack>
           ))}
         </vstack>
       )}
+
     </vstack>
   );
 }

@@ -1,274 +1,195 @@
 # SubGuardian
 
-A Devvit app for Reddit that provides automated moderation, trust scoring, flair management, and community engagement tools for subreddit moderators.
+SubGuardian is an automated moderation assistant for Reddit subreddits. It handles spam filtering, trust scoring, flair management, and community tools — all from a dashboard inside your subreddit. New mods get an AI co-pilot that answers questions about their own sub's data. Veteran mods get precise controls without having to write AutoMod rules from scratch.
 
 ---
 
-## Features
+## What SubGuardian Does
 
-### Automated Post Moderation
-- **Spam scoring** — heuristic signals: duplicate titles/selftext, banned keywords, banned domains, URL-in-title, high URL density, ALL CAPS, excessive punctuation, new account age. Each signal has an additive weight; the total drives the action.
-- **Auto-remove** — posts exceeding the configured threshold are removed immediately.
-- **Auto-flag** — borderline posts are held for review and the author is notified by PM.
-- **Kill switch** — one toggle in the Config UI pauses all automated actions without touching settings.
-- **Per-user rate limit** — max 2 posts per 5 minutes, configurable.
+### Spam Filtering
+
+Every post is scored the moment it's submitted. SubGuardian looks for duplicate titles, duplicate body text, banned keywords, banned domains, links in titles, all-caps words, excessive punctuation, and very new accounts. Each signal adds to a spam score. If the score crosses your flag threshold, the post is removed from the feed and held for mod review. If it crosses your auto-remove threshold, it's removed outright.
+
+Users with a high trust score get a discount on their spam score — an established contributor won't be flagged for a borderline keyword.
+
+### First-Time Offender Recovery
+
+When a user with no prior violations hits the spam threshold for the first time, SubGuardian doesn't hard-remove the post. Instead it holds it, sends the author a PM explaining exactly which signals fired and how to fix them, and opens a 24-hour edit window. The author edits their post and replies `!recheck` to the PM. SubGuardian re-scores the post automatically — if it passes, the post goes live without any mod action needed.
+
+Posts in the recovery window appear with a **Recovery** badge in the Pending Review queue so mods know not to hard-remove them prematurely.
 
 ### Trust Score System
-Scores run 0–1000 and update after every moderation event.
 
-| Tier | Range | Effect |
-|------|-------|--------|
-| Grace | first 5 approved posts | lighter scrutiny, temporary |
-| Untrusted | 0–149 | full spam checks, strictest gates |
-| Low | 150–299 | reduced report weight (0.5×) |
-| Neutral | 300–499 | normal (1.0× report weight) |
-| Trusted | 500–699 | elevated (1.5× report weight) |
-| Highly Trusted | 700–1000 | bypasses all raid/strict mode gates |
+Every user in your subreddit gets a trust score from 0–1000. The score updates after every moderation event and determines how strictly the system treats future posts.
 
-**Score components:**
-- Account age (max +150)
-- Subreddit karma (log-scaled, max +120)
-- Approved post history (+15 each, max +150)
-- Positive signals: awards, top posts, adopted flair proposals (+10/+5/+15)
-- Penalties: removed posts (−15), actioned reports against (−20), temp bans (−75), perm bans (−300)
+| Tier | Score Range | What it means |
+|------|------------|---------------|
+| Grace | New account | Lighter scrutiny for the first 5 approved posts |
+| Untrusted | 0–149 | Full spam checks, strictest gates |
+| Low | 150–299 | Reports carry half weight |
+| Neutral | 300–499 | Standard treatment |
+| Trusted | 500–699 | Reports carry 1.5× weight |
+| Highly Trusted | 700–1000 | Bypasses all raid/strict mode gates |
 
-**Trust decay** — runs weekly; users inactive for 90+ days decay at 5% per cycle, floored at 300 for previously trusted users.
+Trust goes up through approved posts, account age, subreddit karma, helpful reports, awards, and top posts. It goes down through removed posts, actioned reports against the user, and bans.
+
+### Contextual Why-Removed PMs
+
+When a post is flagged or removed, the author receives a PM that names the exact signals that triggered it, shows the spam score vs. your threshold, and gives a concrete suggestion for how to fix the post. It ends with `!recheck` instructions. No generic "your post was removed" messages.
+
+### SubGuardian Coach (AI Co-Pilot)
+
+The Coach tab inside the dashboard lets any mod ask plain-English questions about their own subreddit's data. It answers using your actual config, trust records, recent audit log, and spam stats — not generic Reddit advice.
+
+**Example questions it can answer:**
+- "Why was the last post flagged?"
+- "Is u/username a problem?"
+- "What should I set up first as a new mod?"
+- "Suggest some keywords to block based on recent removals"
+- "What's the system status?"
+- "Explain how our trust scores work"
+
+Six quick-answer chips cover the most common questions so mods don't need to type anything. The "Ask a question..." button opens a free-text form for anything else.
+
+Coach works without any LLM configuration — the heuristic mode reads your Redis data and gives grounded, specific answers. If you configure an LLM API key and endpoint in the Config UI, Coach switches to LLM mode for free-form questions.
+
+### Shadow-Audit Mode
+
+Before adding a new spam keyword to your live filter, you can test it for 24 hours in shadow mode. Shadow mode logs every post the keyword *would have* caught without actually removing anything. After 24 hours, SubGuardian sends your mod team a modmail digest showing how many posts matched and 5 sample titles.
+
+To promote a keyword from shadow mode to live, reply `!shadow-activate <keyword>` to the digest modmail. To add a keyword to shadow mode, go to Config UI → Thresholds and tap the **Test Mode** button next to any keyword.
+
+A countdown timer in the Config UI shows how much time is left on each shadow test.
+
+### Modqueue Case File
+
+Opening a post from the Pending Review queue shows a full case brief instead of just a score:
+
+- Which signals fired and why
+- The author's full history in your subreddit (approved posts, violations, reports)
+- Similar past cases with the same signal mix and what the mod decided
+- A suggested verdict (Approve or Remove) with reasoning
+
+Mods can add a note and take action directly from the case file. Every decision is recorded as precedent for future similar posts.
 
 ### Anti-Raid Mode
-Configurable gates that activate during raids:
-- Minimum account age
-- Minimum karma
-- Minimum trust score
-- Posts per day cap
 
-Users with trust ≥ 700 always bypass all gates regardless of mode. Three presets — **Default**, **Strict**, **Raid** — each tighten thresholds progressively. Raid mode auto-expires via a scheduled job.
+Three built-in presets — Default, Strict, and Raid — progressively tighten posting requirements. In Raid mode, gates can require minimum account age, minimum karma, minimum trust score, and a per-day post cap. Users with trust ≥ 700 always bypass raid gates.
 
-### Coordinated Inauthentic Behaviour (CIB) Detection
-Detects burst-pattern reporting: 3+ reports on the same post within a 5-minute window triggers a modmail alert. If view count is available, a report/view ratio ≥ 10% is treated as organic community response and suppresses the alert (the community genuinely disliked the post rather than coordinating against it).
+When the spike detector sees post volume hit 2.5× the 4-week baseline, it sends your mod team a modmail alert ending with: "Reply `!raid` to activate Raid preset immediately." One reply activates Raid mode without opening the dashboard.
 
-### Spike Detector
-Runs every 15 minutes. Compares the current hour's post volume against the same hour-slot for the previous 4 weeks. If current ≥ 2.5× the baseline average (and at least 10 posts this hour), sends a modmail spike alert. A separate toxicity spike check runs the same logic against average comment toxicity scores.
+Raid mode auto-expires after your configured duration.
 
-### Flair Pipeline
-Three-stage pipeline runs on every approved post:
+### Flair System
 
-1. **Title tag** (opt-in) — `[TagName]` prefix matched against the flair list; applied immediately if found.
-2. **AI auto-apply** — confidence ≥ 0.8 applies the flair silently.
-3. **AI suggestion** — confidence 0.4–0.79 posts a bot comment asking the author to reply "yes" to confirm. A PM is also sent (with 30-minute cooldown). Confirmed flairs are applied and the bot comment is deleted.
+SubGuardian runs a three-stage flair pipeline on every approved post:
 
-The AI layer uses the configured external LLM API as primary, with the built-in keyword/pattern heuristic as automatic fallback (used when the API endpoint or key is not configured, or if the API call fails).
+1. If the title starts with `[Tag]` and that tag matches a flair, it's applied immediately.
+2. If the AI is confident enough (≥ 80%), it applies the flair silently.
+3. At medium confidence (40–79%), it posts a bot comment asking the author to reply "yes" to confirm, and sends them a PM.
 
-### Community Flair Voting
-Mods propose new flairs via the dashboard. The flow:
-1. Mod clicks "Put to Vote" — a modmail thread is opened asking the mod to confirm defaults or customise.
-2. Mod replies `!vote config` to the modmail — the vote post and subreddit announcement are created.
-3. Community members vote (trust ≥ `minTrustToVote`, default 300). One vote per user enforced by Redis NX lock.
-4. Voters earn +1 contribution point on both weekly and all-time leaderboards.
-5. Tally fires when quorum is reached or the voting period expires. Approved flairs are added to both the internal flair list and Reddit's flair template system via `createPostFlairTemplate`.
-6. Only one active vote at a time — staging a new proposal supersedes any existing active one.
+Mods can propose new flairs from the dashboard. SubGuardian opens a modmail thread to confirm voting settings, then creates a community vote post. Members with trust ≥ your minimum vote threshold can vote. Approved flairs are added to your subreddit's flair templates automatically.
+
+### Enhanced Appeal Handling
+
+When a user sends modmail containing appeal language ("appeal", "unfair", "ban", etc.), SubGuardian automatically replies in-thread with a structured analysis:
+
+- A 2–3 bullet summary of what the user said
+- A recommendation (Approve / Deny / Review Manually) with a confidence percentage
+- The user's prior appeal history
+- The full original appeal text below the fold
+
+Mods still make the final call — SubGuardian just front-loads the context so they don't have to look it up.
 
 ### Contribution Leaderboard
-Two sorted sets track contribution points — all-time and current week:
-- Approved post submitted: +1
-- Adopted flair proposal: +15 (trust score component)
-- Voted in a community flair vote: +1
 
-Weekly top contributor is highlighted every Sunday at 20:00 UTC with a stickied post. The old highlight post is unpinned and removed when a new one is created.
+Members earn points for approved posts, helpful reports, and voting in flair elections. Top posts earn bonus points proportional to their upvote score. The weekly top contributor gets a stickied highlight post every Sunday. An all-time leaderboard is also maintained.
 
-### Reporting Flow
-- Reports are weighted by reporter trust tier (untrusted: 0.25×, low: 0.5×, neutral/grace: 1.0×, trusted: 1.5×).
-- Weighted report count reaching `autoActionThreshold` triggers automatic removal.
-- View/report ratio check: if enough views exist and the report rate is high, the threshold is lowered.
-- CIB check runs on every report event.
+### Quiet Hours
 
-### Ban Evasion Detection
-New accounts with usernames similar (Levenshtein distance ≤ 2) to previously banned accounts trigger a modmail alert.
-
-### Modmail Routing
-- `!appeal` — routes to appeal handler, runs AI analysis on the appeal text.
-- `!vote config` — confirms a pending flair vote proposal and creates the vote + announcement posts.
-
-### Stats Report
-Triggered on demand via subreddit menu. Sends a modmail with:
-- 7-day post/removal/flag/approval counts
-- Report handling stats (total, actioned, false positive)
-- System status (Redis usage, kill switch state, raid mode state)
-- Feature toggle states
-- Last 10 audit log entries
-
-### Audit Log
-Every moderation action is written to a bounded log (max 1000 entries) readable from the dashboard Audit Log tab.
-
-### Redis Memory Monitor
-Runs hourly. Warns at 80% of 500 MB, critical at 90%. Sends a modmail alert on first breach per day.
+If your mod team doesn't want non-critical notifications in the middle of the night, enable quiet hours in the Config UI and set a UTC start and end time. Spike alerts, stats digests, and routine notifications are silently dropped during quiet hours. Critical alerts — CIB confirmed, raid mode activated, Redis memory critical — always deliver regardless of the hour.
 
 ---
 
-## Dashboard (Custom Post UI)
+## Dashboard
 
-Opened via subreddit menu → "SubGuardian: Open Dashboard". Six tabs:
+Open the dashboard from the subreddit menu: **SubGuardian: Open Dashboard**
 
-| Tab | Contents |
-|-----|----------|
-| Overview | Today's stats, 7-day averages, system status indicators |
-| Pending Review | Flagged posts with spam scores, trust badges, approve/remove actions |
-| Posts | Top upvoted posts from the last 7 days ranked by score |
-| Content Interests | Topic frequency from recent post titles; "Put to Vote" button per topic |
-| Reports | Report/actioned counts |
-| Audit Log | Last 10 audit entries |
-
-### Config UI
-Opened via subreddit menu → "SubGuardian: Open Config". Controls:
-
-- **Presets** — Default / Strict / Raid (one click applies a full config bundle)
-- **Feature toggles** — spam detection, report handling, anti-raid, ban evasion, flair auto-assign, flair title tags, post rate limit
-- **Thresholds tab** — auto-remove threshold, auto-flag threshold, `minTrustToVote` (buttons: 100/200/300/400/500)
-- **Spam keywords** — add/remove banned keywords
-- **Anti-raid gates** — enable/configure each gate individually
+| Tab | What you'll find |
+|-----|-----------------|
+| Overview | Today's post/removal/flag counts, 7-day averages, system status |
+| Pending Review | Flagged posts — click any to open the full Case File |
+| Posts | Top upvoted posts this week; content interest topics |
+| Leaderboard | All-time and weekly contribution rankings |
+| Audit Log | Recent moderation actions taken by SubGuardian |
+| Coach | AI co-pilot — ask anything about your sub's data |
 
 ---
 
-## Scheduled Jobs
+## Config UI
 
-| Job | Schedule | Purpose |
-|-----|----------|---------|
-| `aggregate_builder` | Every 15 min | Computes 7-day rolling averages for posts, reports, users |
-| `spike_detector` | Every 15 min | Compares current hour to 4-week baseline; alerts on 2.5× spike |
-| `redis_monitor` | Hourly | Checks Redis memory usage against 500 MB cap |
-| `trust_decay` | Weekly | Decays scores for users inactive 90+ days |
-| `raid_mode_expiry` | Hourly | Auto-expires raid mode after configured duration |
-| `flair_vote_tallier` | Hourly + on quorum | Tallies votes; applies approved flairs to Reddit |
-| `weekly_highlight` | Sunday 20:00 UTC | Posts top contributor highlight, pins it at position 2 |
-| `retry_queue_drain` | Every 5 min | Retries rate-limited moderation actions |
+Open from the subreddit menu: **SubGuardian: Open Config**
 
----
-
-## Trust Score Formula
-
-```
-score = accountAge + subKarma + approvalRate + positiveSignals − penalties
-      = min(ageDays / 7.5, 150)
-      + min(log10(max(karma, 1)) × 40, 120)
-      + min(approvedPosts × 15, 150)
-      + min(awards×10 + topPosts×5 + helpfulReports×3 + adoptedFlairs×15, 100)
-      − min(removedPosts×15 + actionedReports×20 + tempBans×75 + permBans×300, 400)
-```
-
-Clamped to [0, 1000].
+| Section | What you can configure |
+|---------|----------------------|
+| Presets | Apply a Default, Strict, or Raid configuration bundle in one click |
+| Features | Toggle spam detection, report handling, anti-raid, ban evasion, flair pipeline, post rate limiting individually |
+| Thresholds | Auto-remove threshold, auto-flag threshold, minimum trust to vote on flairs, shadow-test threshold |
+| Spam Keywords | Add and remove banned keywords; toggle any keyword into Shadow-Audit test mode |
+| Anti-Raid Gates | Enable/disable and tune each gate (account age, karma, trust score, posts per day) |
+| Quiet Hours | Enable and set the UTC window for suppressing non-critical modmail |
+| Danger Zone | Kill switch (pauses all automated actions), config reset |
 
 ---
 
-## AI / Flair Intelligence
+## Modmail Commands
 
-The AI layer is a two-tier system:
+Reply these commands to SubGuardian modmails to trigger actions:
 
-1. **Primary — External LLM API** (`LLMProvider`): calls the configured endpoint with a Bearer token. Used for flair suggestion, content analysis, and appeal analysis.
-2. **Fallback — Built-in heuristic** (`HeuristicProvider`): keyword matching and pattern scoring. Activates automatically when the API endpoint/key is not set or when the API call fails.
-
-To activate the LLM: set `LLM_API_KEY` via `devvit settings set` and configure the endpoint in the Config UI. No code change needed — the provider selection is automatic.
-
----
-
-## Redis Key Structure
-
-All keys are defined in `src/redis/schema.ts`. Major namespaces:
-
-| Namespace | Contents |
-|-----------|----------|
-| `user:{id}:trust` | Trust score record (JSON) |
-| `user:{id}:activity` | Activity counters |
-| `user:{id}:grace` | Grace period flag |
-| `post:{id}:reports` | Report record with weighted count and CIB flag |
-| `post:{id}:score` | Spam score breakdown |
-| `agg:posts:daily:{YYYYMMDD}` | Daily post aggregate |
-| `agg:reports:daily:{YYYYMMDD}` | Daily report aggregate |
-| `spike:posts:{YYYYMMDDHH}` | Hourly post count for spike detection |
-| `leaderboard:contributions` | All-time contribution sorted set |
-| `leaderboard:contributions:weekly:{YYYYMMDD}` | Weekly contribution sorted set |
-| `leaderboard:trust` | Trust score sorted set |
-| `flair:proposal:{id}` | Vote proposal state |
-| `flair:vote:lock:{proposalId}:{userId}` | NX lock preventing double-votes |
-| `sub:config` | Full subreddit config (JSON) |
-| `audit:log` | Bounded audit log (max 1000 entries) |
+| Command | Who can use | What it does |
+|---------|------------|--------------|
+| `!recheck` | Any user | Re-scores a held post after the author edits it |
+| `!raid` | Moderators | Activates Raid preset immediately from a spike alert |
+| `!shadow-activate <keyword>` | Moderators | Promotes a shadow-audit keyword to your live spam filter |
+| `!keyword add <word>` | Moderators | Adds a keyword to the spam list |
+| `!keyword remove <word>` | Moderators | Removes a keyword from the spam list |
+| `!keyword list` | Moderators | Lists all current banned keywords |
+| `!vote config` | Moderators | Confirms a pending flair vote with optional custom settings |
 
 ---
 
-## Permissions Required
+## How Spam Scoring Works
 
-Declared in `devvit.yaml`:
-- `posts` — submit and manage posts
-- `privatemessages` — send PMs and modmail
-- `flair` — apply and create flair templates
-- `modposts` — approve/remove posts
+| Signal | What it catches |
+|--------|----------------|
+| Duplicate title | Same or very similar title posted in the last 30 days |
+| Duplicate body | Near-identical selftext posted recently |
+| Banned domain | Link to a domain on your blocked list |
+| Banned keyword | A word or phrase from your spam keyword list |
+| URL in title | Link placed directly in the post title |
+| High URL density | Body text is mostly links with little original content |
+| ALL CAPS | Three or more all-caps words in the title |
+| Excessive punctuation | Three or more consecutive `!` or `?` marks |
+| Very new account | Account created less than 7 days ago |
 
----
-
-## Setup
-
-### Prerequisites
-- [Devvit CLI](https://developers.reddit.com/docs/devvit_cli) installed and authenticated
-- Node.js 18+
-
-### Install and deploy
-```bash
-npm install
-devvit upload
-```
-
-### Configure LLM (optional)
-```bash
-devvit settings set LLM_API_KEY <your-key>
-```
-Then set the API endpoint in the Config UI. Without this the heuristic provider handles all AI tasks.
-
-### Development testing
-```bash
-cd botTesting
-npm install
-# Terminal 1 — coordination server
-npx ts-node coordination/server.ts
-# Terminal 2 — run a scenario
-npx ts-node scenarios/12_cib_local.ts
-npx ts-node scenarios/17_spikeDetector_local.ts
-```
-
-Selenium-based scenarios (02–11, 13–16) require Chrome + ChromeDriver and credentials in `botTesting/.env` (see `.env.example`).
+Each signal adds to a score between 0 and 1. Your auto-flag and auto-remove thresholds control what happens at each level. Users with higher trust scores get a discount applied to their final score.
 
 ---
 
-## CIB Detection Parameters
+## Automated Alerts SubGuardian Sends
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| `MIN_BURST_COUNT` | 3 | Minimum reports within window to check |
-| `BURST_WINDOW_MS` | 5 minutes | Reports must arrive within this window |
-| `ORGANIC_REPORT_RATIO` | 10% | If reports/views ≥ 10%, treat as organic — no CIB alert |
-
----
-
-## Spam Score Signals
-
-| Signal | Weight | Trigger |
-|--------|--------|---------|
-| `title_duplicate` | 0.45 | Same title seen in last 30 days |
-| `selftext_duplicate` | 0.40 | Near-identical body seen in last 30 days |
-| `domain_banned` | 0.55 | URL domain on banned list |
-| `banned_keyword` | 0.50 | Configured keyword in title or body |
-| `url_in_title` | 0.30 | URL detected in post title |
-| `high_url_density` | 0.25 | Links > 15% of body words |
-| `excessive_caps` | 0.25 | 3+ ALL-CAPS words in title |
-| `excessive_punctuation` | 0.25 | 3+ consecutive `!` or `?` |
-| `very_new_account` | 0.25 | Account age < 7 days |
-
-Trust offset: `−(trustScore / 1000) × 0.3` applied after summing signals.
+- **Post volume spike** — current hour is 2.5× the 4-week baseline
+- **Toxicity surge** — comment toxicity is significantly above normal
+- **Possible ban evasion** — new account with a username similar to a banned account
+- **Coordinated reporting (CIB)** — 3+ reports on the same post within 5 minutes
+- **Redis memory warning** — storage approaching the 500 MB limit
+- **Shadow-audit digest** — 24-hour report on what a test keyword would have caught
+- **Weekly top contributor** — stickied highlight post every Sunday
 
 ---
 
-## Cleanup Before App Review
+## Getting SubGuardian for Your Subreddit
 
-1. Remove or disable the dev-only menu items in `src/main.ts`:
-   - "SubGuardian: [DEV] Clear Test Caches"
-   - "SubGuardian: [DEV] Set User Trust Score"
-   - "SubGuardian: [DEV] Trigger Job Now"
-2. Run `devvit upload` with a clean build.
-3. Delete or archive `botTesting/results.md` and `botTesting/testing.md` logs.
+SubGuardian is installed through the [Reddit Developer Platform](https://developers.reddit.com/). Once installed, open the subreddit menu to access the dashboard and config UI. No command-line setup is required for mods — SubGuardian runs entirely within Reddit.
+
+The default configuration works out of the box with sensible thresholds. Most subreddits should review the **Thresholds** and **Spam Keywords** sections in the Config UI within the first week to tune it for their community.

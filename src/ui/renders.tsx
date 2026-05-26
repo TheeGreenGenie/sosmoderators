@@ -4,6 +4,8 @@ import { HealthOverview } from './dashboard/HealthOverview.js';
 import { UserLeaderboard } from './dashboard/UserLeaderboard.js';
 import { ContentInterests } from './dashboard/ContentInterests.js';
 import { PostPerformance } from './dashboard/PostPerformance.js';
+import { CoachTab } from './dashboard/Coach.js';
+import type { FlaggedPostItem } from './dashboard/CaseFile.js';
 import { renderFlairVotePost } from './FlairVotePost.js';
 import { renderLeaderboardPost } from './LeaderboardPost.js';
 import { Keys, weekKey } from '../redis/schema.js';
@@ -14,7 +16,7 @@ import { activateKillSwitch, deactivateKillSwitch, isKillSwitchActive } from '..
 import { logAction } from '../moderation/auditLog.js';
 
 type AppView = 'dashboard' | 'config' | 'onboarding' | 'vote' | 'leaderboard';
-type DashboardTab = 'health' | 'topics' | 'leaderboard' | 'posts';
+type DashboardTab = 'health' | 'topics' | 'leaderboard' | 'posts' | 'coach';
 type ConfigTab = 'presets' | 'features' | 'thresholds' | 'danger';
 
 // ─── Unified Router ──────────────────────────────────────────────────────────
@@ -93,7 +95,19 @@ export function renderDashboard(context: Context): JSX.Element {
     }
   });
 
-  const [leaderboard] = context.useState(async () => {
+  const [flaggedPostsJson] = context.useState(async () => {
+    const raw = await context.redis.get('dashboard:flagged_posts');
+    if (!raw) return JSON.stringify([]);
+    const posts = JSON.parse(raw) as FlaggedPostItem[];
+    const hydrated = await Promise.all(posts.slice(0, 25).map(async (p) => ({
+      ...p,
+      recovery: !!(await context.redis.get(Keys.postRecovery(p.id))),
+    })));
+    return JSON.stringify(hydrated);
+  });
+  const flaggedPosts = JSON.parse(flaggedPostsJson) as FlaggedPostItem[];
+
+  async function fetchLeaderboard() {
     const members = (await context.redis.zRange(Keys.leaderboardTrust, 0, 24, { by: 'rank', reverse: true }))
       .filter((m) => m.member.startsWith('t2_'));
     return Promise.all(members.map(async (m) => {
@@ -109,22 +123,26 @@ export function renderDashboard(context: Context): JSX.Element {
         tier: trust?.tier ?? ('neutral' as const),
       };
     }));
-  });
+  }
+
+  const [leaderboard, setLeaderboard] = context.useState(fetchLeaderboard);
 
   const dashTabs: { id: DashboardTab; label: string }[] = [
     { id: 'health', label: 'Health' },
     { id: 'topics', label: 'Topics' },
     { id: 'leaderboard', label: 'Leaderboard' },
     { id: 'posts', label: 'Posts' },
+    { id: 'coach', label: 'Coach' },
   ];
 
   return (
     <vstack height="100%" width="100%">
-      <hstack gap="small" padding="small" backgroundColor="neutral-background-selected">
+      <hstack gap="small" padding="small" backgroundColor="neutral-background-selected" alignment="center middle">
         {dashTabs.map((t) => (
           <button
             key={t.id}
             size="small"
+            grow
             appearance={activeTab === t.id ? 'primary' : 'secondary'}
             onPress={() => setActiveTab(t.id)}
           >
@@ -134,7 +152,7 @@ export function renderDashboard(context: Context): JSX.Element {
       </hstack>
       <vstack grow>
         {activeTab === 'health' && HealthOverview(health)}
-        {activeTab === 'leaderboard' && UserLeaderboard(leaderboard)}
+        {activeTab === 'leaderboard' && UserLeaderboard(leaderboard, async () => { setLeaderboard(await fetchLeaderboard()); })}
         {activeTab === 'topics' && ContentInterests({
           topics: topicsData.topics,
           flairSuggestions: topicsData.flairSuggestions,
@@ -223,7 +241,8 @@ export function renderDashboard(context: Context): JSX.Element {
             context.ui.showToast(`Vote staged — reply to the modmail to publish.`);
           },
         })}
-        {activeTab === 'posts' && PostPerformance(topPosts)}
+        {activeTab === 'posts' && PostPerformance(context, topPosts, [])}
+        {activeTab === 'coach' && CoachTab(context)}
       </vstack>
     </vstack>
   );
@@ -235,7 +254,7 @@ export function renderConfig(context: Context): JSX.Element {
   const redis = context.redis;
   const [activeTab, setActiveTab] = context.useState<ConfigTab>('presets');
 
-  const [stateJson] = context.useState(async () => {
+  const [stateJson, setStateJson] = context.useState(async () => {
     const [config, killSwitchOn] = await Promise.all([
       getConfig(redis),
       isKillSwitchActive(redis),
@@ -247,87 +266,129 @@ export function renderConfig(context: Context): JSX.Element {
     ? JSON.parse(stateJson) as { config: SubConfig; killSwitchOn: boolean }
     : null;
 
-  return (
-    <vstack height="100%" width="100%" gap="small" padding="small">
-      <text size="large" weight="bold">SubGuardian Config</text>
+  async function saveConfig(updated: SubConfig) {
+    await saveConfig(updated);
+    setStateJson(JSON.stringify({ config: updated, killSwitchOn: parsed?.killSwitchOn ?? false }));
+  }
 
-      {/* Tabs always render — no early return that would drop them */}
-      <hstack gap="small">
-        <button size="small" appearance={activeTab === 'presets' ? 'primary' : 'secondary'} onPress={() => setActiveTab('presets')}>Presets</button>
-        <button size="small" appearance={activeTab === 'features' ? 'primary' : 'secondary'} onPress={() => setActiveTab('features')}>Features</button>
-        <button size="small" appearance={activeTab === 'thresholds' ? 'primary' : 'secondary'} onPress={() => setActiveTab('thresholds')}>Thresholds</button>
-        <button size="small" appearance={activeTab === 'danger' ? 'primary' : 'secondary'} onPress={() => setActiveTab('danger')}>Danger Zone</button>
+  return (
+    <vstack height="100%" width="100%">
+      {/* Config header */}
+      <vstack
+        width="100%"
+        backgroundColor="#0079d322"
+        padding="medium"
+        gap="small"
+      >
+        <text size="xlarge" weight="bold">Config</text>
+        <text size="small" color="neutral-content-weak">
+          {parsed?.killSwitchOn ? '⛔ Emergency stop active' : '🟢 SubGuardian is running'}
+        </text>
+      </vstack>
+
+      {/* Tab bar */}
+      <hstack gap="small" padding="small" backgroundColor="neutral-background-selected" alignment="center middle">
+        <button size="small" grow appearance={activeTab === 'presets' ? 'primary' : 'secondary'} onPress={() => setActiveTab('presets')}>Presets</button>
+        <button size="small" grow appearance={activeTab === 'features' ? 'primary' : 'secondary'} onPress={() => setActiveTab('features')}>Features</button>
+        <button size="small" grow appearance={activeTab === 'thresholds' ? 'primary' : 'secondary'} onPress={() => setActiveTab('thresholds')}>Thresholds</button>
+        <button size="small" grow appearance={activeTab === 'danger' ? 'primary' : 'secondary'} onPress={() => setActiveTab('danger')}>Danger</button>
       </hstack>
 
-      {!parsed && <text size="small" color="neutral-content-weak">Loading...</text>}
+      {!parsed && (
+        <vstack grow alignment="center middle">
+          <text size="small" color="neutral-content-weak">Loading config…</text>
+        </vstack>
+      )}
 
       {parsed && activeTab === 'presets' && (
-        <vstack gap="small" grow>
-          {(['default', 'strict', 'raid'] as PresetName[]).map((p) => (
-            <vstack key={p} backgroundColor="neutral-background" padding="small" cornerRadius="medium" gap="small">
-              <hstack alignment="start middle">
-                <text grow weight="bold">{p.charAt(0).toUpperCase() + p.slice(1)}</text>
+        <vstack gap="medium" padding="medium" grow>
+          {([
+            { id: 'default', icon: '⚖️', label: 'Default', desc: 'Balanced automation for established subreddits.' },
+            { id: 'strict',  icon: '🔒', label: 'Strict',  desc: 'Tighter thresholds. Requires 90+ day account age.' },
+            { id: 'raid',    icon: '🛡️', label: 'Raid',    desc: 'Maximum protection. 180+ day accounts, 1000+ karma.' },
+          ] as { id: PresetName; icon: string; label: string; desc: string }[]).map((p) => (
+            <vstack
+              key={p.id}
+              backgroundColor="neutral-background"
+              padding="medium"
+              cornerRadius="medium"
+              gap="small"
+            >
+              <hstack alignment="start middle" gap="small">
+                <text size="large">{p.icon}</text>
+                <text grow weight="bold" size="large">{p.label}</text>
                 <button
                   size="small"
                   appearance="primary"
                   onPress={async () => {
-                    await setPreset(redis, p);
+                    await setPreset(redis, p.id);
                     await logAction(redis, {
                       timestamp: Date.now(),
                       action: 'preset_changed',
-                      targetId: p,
+                      targetId: p.id,
                       targetType: 'config',
                       actor: 'mod',
-                      reason: `Switched to ${p} preset`,
+                      reason: `Switched to ${p.id} preset`,
                     });
-                    context.ui.showToast(`Switched to ${p} preset`);
+                    const newConfig = await getConfig(redis);
+                    setStateJson(JSON.stringify({ config: newConfig, killSwitchOn: parsed?.killSwitchOn ?? false }));
+                    context.ui.showToast(`Switched to ${p.label} preset`);
                   }}
                 >
-                  Select
+                  Apply
                 </button>
               </hstack>
-              <text size="small" color="neutral-content-weak">
-                {p === 'default' && 'Balanced automation for established subreddits.'}
-                {p === 'strict' && 'Tighter thresholds. Requires 90+ day account age.'}
-                {p === 'raid' && 'Maximum protection. 180+ day accounts, 1000+ karma.'}
-              </text>
+              <text size="small" color="neutral-content-weak">{p.desc}</text>
             </vstack>
           ))}
         </vstack>
       )}
 
       {parsed && activeTab === 'features' && (() => {
+        const FEATURE_LABELS: Record<string, string> = {
+          spamDetection: 'Spam Detection',
+          reportHandling: 'Report Handling',
+          antiRaid: 'Anti-Raid',
+          banEvasion: 'Ban Evasion',
+          flairAutoAssign: 'Auto Flair',
+          flairTitleTags: 'Flair Title Tags',
+          trustScoring: 'Trust Scoring',
+          postRateLimit: 'Post Rate Limit',
+          modmailRouting: 'Modmail Routing',
+        };
         const entries = Object.entries(parsed.config.features) as [string, boolean][];
-        const colLeft = entries.filter((_, i) => i % 2 === 0);
-        const colRight = entries.filter((_, i) => i % 2 === 1);
-        const makeToggle = (feature: string, enabled: boolean) => (
-          <hstack key={feature} backgroundColor="neutral-background" padding="small" cornerRadius="small" alignment="start middle">
-            <text grow size="small">{feature}</text>
-            <button
-              size="small"
-              appearance={enabled ? 'primary' : 'secondary'}
-              onPress={async () => {
-                const updated = { ...parsed.config, features: { ...parsed.config.features, [feature]: !enabled } };
-                await setConfig(redis, updated);
-                context.ui.showToast(`${feature} ${!enabled ? 'enabled' : 'disabled'}`);
-              }}
-            >{enabled ? 'ON' : 'OFF'}</button>
-          </hstack>
-        );
         return (
-          <hstack gap="medium" grow>
-            <vstack gap="small" grow>
-              {colLeft.map(([f, e]) => makeToggle(f, e))}
-            </vstack>
-            <vstack gap="small" grow>
-              {colRight.map(([f, e]) => makeToggle(f, e))}
-            </vstack>
-          </hstack>
+          <vstack gap="small" padding="medium" grow>
+            {entries.map(([feature, enabled]) => (
+              <hstack
+                key={feature}
+                backgroundColor="neutral-background"
+                padding="medium"
+                cornerRadius="medium"
+                alignment="start middle"
+              >
+                <vstack grow gap="small">
+                  <text weight="bold" size="small">{FEATURE_LABELS[feature] ?? feature}</text>
+                </vstack>
+                <button
+                  size="small"
+                  appearance={enabled ? 'primary' : 'secondary'}
+                  onPress={async () => {
+                    const updated = { ...parsed.config, features: { ...parsed.config.features, [feature]: !enabled } };
+                    await saveConfig(updated);
+                    context.ui.showToast(`${FEATURE_LABELS[feature] ?? feature} ${!enabled ? 'enabled' : 'disabled'}`);
+                  }}
+                >
+                  {enabled ? 'ON' : 'OFF'}
+                </button>
+              </hstack>
+            ))}
+          </vstack>
         );
       })()}
 
       {parsed && activeTab === 'thresholds' && (
-        <vstack gap="small" grow>
+        <vstack gap="medium" padding="medium" grow>
           <text weight="bold">Spam Detection Thresholds</text>
           <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
             <hstack alignment="start middle">
@@ -342,13 +403,36 @@ export function renderConfig(context: Context): JSX.Element {
                   appearance={parsed.config.spamDetection.autoFlagThreshold === v ? 'primary' : 'secondary'}
                   onPress={async () => {
                     const updated = { ...parsed.config, spamDetection: { ...parsed.config.spamDetection, autoFlagThreshold: v } };
-                    await setConfig(redis, updated);
+                    await saveConfig(updated);
                     context.ui.showToast(`Flag threshold set to ${v}`);
                   }}
                 >
                   {String(v)}
                 </button>
               ))}
+            </hstack>
+            <hstack alignment="start middle" gap="small">
+              <text grow size="small" color="neutral-content-weak">
+                Shadow-test candidate threshold: {parsed.config.shadowAudit.thresholdTestValue.toFixed(2)}
+              </text>
+              <button
+                size="small"
+                appearance={parsed.config.shadowAudit.thresholdTestActive ? 'primary' : 'secondary'}
+                onPress={async () => {
+                  const updated = {
+                    ...parsed.config,
+                    shadowAudit: {
+                      ...parsed.config.shadowAudit,
+                      thresholdTestActive: !parsed.config.shadowAudit.thresholdTestActive,
+                      startedAt: !parsed.config.shadowAudit.thresholdTestActive ? Date.now() : parsed.config.shadowAudit.startedAt,
+                    },
+                  };
+                  await saveConfig(updated);
+                  context.ui.showToast(`Shadow threshold test ${updated.shadowAudit.thresholdTestActive ? 'enabled' : 'disabled'}`);
+                }}
+              >
+                {parsed.config.shadowAudit.thresholdTestActive ? 'Testing' : 'Test Mode'}
+              </button>
             </hstack>
           </vstack>
           <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
@@ -364,7 +448,7 @@ export function renderConfig(context: Context): JSX.Element {
                   appearance={parsed.config.spamDetection.autoRemoveThreshold === v ? 'primary' : 'secondary'}
                   onPress={async () => {
                     const updated = { ...parsed.config, spamDetection: { ...parsed.config.spamDetection, autoRemoveThreshold: v } };
-                    await setConfig(redis, updated);
+                    await saveConfig(updated);
                     context.ui.showToast(`Remove threshold set to ${v}`);
                   }}
                 >
@@ -377,24 +461,52 @@ export function renderConfig(context: Context): JSX.Element {
           <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
             <hstack gap="small">
               {['crypto', 'OnlyFans', 'free money', 'click here'].map((kw) => (
-                <button
-                  key={kw}
-                  size="small"
-                  appearance={parsed.config.spamDetection.bannedKeywords.includes(kw) ? 'primary' : 'secondary'}
-                  onPress={async () => {
-                    const current = parsed.config.spamDetection.bannedKeywords;
-                    const next = current.includes(kw)
-                      ? current.filter((k) => k !== kw)
-                      : [...current, kw];
-                    const updated = { ...parsed.config, spamDetection: { ...parsed.config.spamDetection, bannedKeywords: next } };
-                    await setConfig(redis, updated);
-                    context.ui.showToast(`${kw} ${current.includes(kw) ? 'removed' : 'added'}`);
-                  }}
-                >
-                  {kw}
-                </button>
+                <vstack key={kw} gap="small">
+                  <button
+                    size="small"
+                    appearance={parsed.config.spamDetection.bannedKeywords.includes(kw) ? 'primary' : 'secondary'}
+                    onPress={async () => {
+                      const current = parsed.config.spamDetection.bannedKeywords;
+                      const next = current.includes(kw)
+                        ? current.filter((k) => k !== kw)
+                        : [...current, kw];
+                      const updated = { ...parsed.config, spamDetection: { ...parsed.config.spamDetection, bannedKeywords: next } };
+                      await saveConfig(updated);
+                      context.ui.showToast(`${kw} ${current.includes(kw) ? 'removed' : 'added'}`);
+                    }}
+                  >
+                    {kw}
+                  </button>
+                  <button
+                    size="small"
+                    appearance={parsed.config.shadowAudit.keywords.includes(kw) ? 'primary' : 'secondary'}
+                    onPress={async () => {
+                      const shadow = parsed.config.shadowAudit.keywords;
+                      const nextShadow = shadow.includes(kw)
+                        ? shadow.filter((k) => k !== kw)
+                        : [...shadow, kw];
+                      const updated = {
+                        ...parsed.config,
+                        shadowAudit: {
+                          ...parsed.config.shadowAudit,
+                          keywords: nextShadow,
+                          startedAt: nextShadow.length > 0 ? (parsed.config.shadowAudit.startedAt ?? Date.now()) : null,
+                        },
+                      };
+                      await saveConfig(updated);
+                      context.ui.showToast(`${kw} shadow test ${shadow.includes(kw) ? 'stopped' : 'started'}`);
+                    }}
+                  >
+                    Test
+                  </button>
+                </vstack>
               ))}
             </hstack>
+            {parsed.config.shadowAudit.keywords.length > 0 ? (
+              <text size="small" color="#ffaa00">
+                Active shadow tests: {parsed.config.shadowAudit.keywords.join(', ')} | {Math.max(0, 24 - Math.floor((Date.now() - (parsed.config.shadowAudit.startedAt ?? Date.now())) / 3_600_000))}h left
+              </text>
+            ) : null}
             {(() => {
               const defaults = ['crypto', 'onfans', 'free money', 'click here'];
               const customCount = parsed.config.spamDetection.bannedKeywords.filter(
@@ -421,7 +533,7 @@ export function renderConfig(context: Context): JSX.Element {
                   appearance={parsed.config.flairVoting.minTrustToVote === v ? 'primary' : 'secondary'}
                   onPress={async () => {
                     const updated = { ...parsed.config, flairVoting: { ...parsed.config.flairVoting, minTrustToVote: v } };
-                    await setConfig(redis, updated);
+                    await saveConfig(updated);
                     context.ui.showToast(`Min trust to vote set to ${v}`);
                   }}
                 >
@@ -431,11 +543,62 @@ export function renderConfig(context: Context): JSX.Element {
             </hstack>
             <text size="small" color="neutral-content-weak">Users below this score cannot cast flair votes.</text>
           </vstack>
+          <text weight="bold">Quiet Hours</text>
+          <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
+            <hstack alignment="start middle">
+              <text grow size="small">Pause non-critical modmail</text>
+              <button
+                size="small"
+                appearance={parsed.config.quietHours.enabled ? 'primary' : 'secondary'}
+                onPress={async () => {
+                  const updated = {
+                    ...parsed.config,
+                    quietHours: { ...parsed.config.quietHours, enabled: !parsed.config.quietHours.enabled },
+                  };
+                  await saveConfig(updated);
+                  context.ui.showToast(`Quiet hours ${updated.quietHours.enabled ? 'enabled' : 'disabled'}`);
+                }}
+              >
+                {parsed.config.quietHours.enabled ? 'ON' : 'OFF'}
+              </button>
+            </hstack>
+            <hstack gap="small">
+              {[20, 22, 23].map((h) => (
+                <button
+                  key={`start-${h}`}
+                  size="small"
+                  appearance={parsed.config.quietHours.startHour === h ? 'primary' : 'secondary'}
+                  onPress={async () => {
+                    await saveConfig({ ...parsed.config, quietHours: { ...parsed.config.quietHours, startHour: h } });
+                    context.ui.showToast(`Quiet hours start at ${h}:00 UTC`);
+                  }}
+                >
+                  {h}:00
+                </button>
+              ))}
+              {[6, 7, 8].map((h) => (
+                <button
+                  key={`end-${h}`}
+                  size="small"
+                  appearance={parsed.config.quietHours.endHour === h ? 'primary' : 'secondary'}
+                  onPress={async () => {
+                    await saveConfig({ ...parsed.config, quietHours: { ...parsed.config.quietHours, endHour: h } });
+                    context.ui.showToast(`Quiet hours end at ${h}:00 UTC`);
+                  }}
+                >
+                  {h}:00
+                </button>
+              ))}
+            </hstack>
+            <text size="small" color="neutral-content-weak">
+              Current: {parsed.config.quietHours.startHour}:00-{parsed.config.quietHours.endHour}:00 UTC. Critical alerts still deliver.
+            </text>
+          </vstack>
         </vstack>
       )}
 
       {parsed && activeTab === 'danger' && (
-        <vstack gap="medium" grow>
+        <vstack gap="medium" padding="medium" grow>
           <vstack
             backgroundColor={parsed.killSwitchOn ? '#ff444422' : 'neutral-background'}
             padding="medium"
@@ -453,10 +616,12 @@ export function renderConfig(context: Context): JSX.Element {
                 if (parsed.killSwitchOn) {
                   await deactivateKillSwitch(redis);
                   await logAction(redis, { timestamp: Date.now(), action: 'kill_switch_deactivated', targetId: 'system', targetType: 'system', actor: 'mod', reason: 'Deactivated via Config UI' });
+                  setStateJson(JSON.stringify({ config: parsed.config, killSwitchOn: false }));
                   context.ui.showToast('Automation resumed.');
                 } else {
                   await activateKillSwitch(redis);
                   await logAction(redis, { timestamp: Date.now(), action: 'kill_switch_activated', targetId: 'system', targetType: 'system', actor: 'mod', reason: 'Activated via Config UI' });
+                  setStateJson(JSON.stringify({ config: parsed.config, killSwitchOn: true }));
                   context.ui.showToast('Emergency stop activated.');
                 }
               }}
@@ -493,6 +658,8 @@ export function renderConfig(context: Context): JSX.Element {
               onPress={async () => {
                 await setPreset(redis, 'default');
                 await logAction(redis, { timestamp: Date.now(), action: 'config_reset', targetId: 'system', targetType: 'config', actor: 'mod', reason: 'Config reset to default via Danger Zone' });
+                const newConfig = await getConfig(redis);
+                setStateJson(JSON.stringify({ config: newConfig, killSwitchOn: parsed.killSwitchOn }));
                 context.ui.showToast('Config reset to Default preset.');
               }}
             >

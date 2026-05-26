@@ -7,6 +7,8 @@ export interface MinimalContext {
 }
 import { checkRateLimit, enqueueRetry, type ActionType } from './rateLimiter.js';
 import { logAction } from './auditLog.js';
+import { getConfig } from '../redis/config.js';
+import { shouldDeliverNow } from '../utils/quietHours.js';
 
 interface ModActionOptions {
   context: TriggerContext | Context;
@@ -168,8 +170,22 @@ export async function sendModAlert(
   context: MinimalContext,
   redis: RedisClient,
   subject: string,
-  body: string
+  body: string,
+  isCritical: boolean = false
 ): Promise<void> {
+  const config = await getConfig(redis);
+  if (!shouldDeliverNow(config, isCritical)) {
+    await logAction(redis, {
+      timestamp: Date.now(),
+      action: 'modmail_quiet_hours_dropped',
+      targetId: 'system',
+      targetType: 'system',
+      actor: 'SubGuardian',
+      reason: subject,
+    });
+    return;
+  }
+
   await sendModmail({
     context: context as Context,
     redis,

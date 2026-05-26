@@ -18,10 +18,13 @@ const TIER_BADGE: Record<TrustTier, string> = {
   highly_trusted: '⭐',
 };
 
-export function UserLeaderboard(entries: LeaderboardEntry[]): JSX.Element {
+export function UserLeaderboard(entries: LeaderboardEntry[], onRefresh: () => Promise<void>): JSX.Element {
   return (
     <vstack gap="small" padding="medium">
-      <text size="xlarge" weight="bold">Trust Leaderboard</text>
+      <hstack alignment="start middle">
+        <text size="xlarge" weight="bold" grow>Trust Leaderboard</text>
+        <button size="small" appearance="secondary" onPress={onRefresh}>Refresh</button>
+      </hstack>
       {entries.length === 0 && (
         <text color="neutral-content-weak">No users tracked yet.</text>
       )}

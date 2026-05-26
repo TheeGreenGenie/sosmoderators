@@ -1,16 +1,32 @@
 import { Devvit } from '@devvit/public-api';
 import type { TriggerEventType, TriggerContext } from '@devvit/public-api';
 import { triggerGuard, isFeatureEnabled } from '../moderation/killSwitch.js';
-import { getConfig, setConfig } from '../redis/config.js';
-import { getTrustScore, isAppealOnCooldown, appendAppeal } from '../redis/users.js';
+import { getConfig, setConfig, setPreset } from '../redis/config.js';
+import { getTrustScore, getActivity, getAppealLog, isAppealOnCooldown, appendAppeal } from '../redis/users.js';
 import { getAIProvider } from '../ai/interface.js';
 import { logAction } from '../moderation/auditLog.js';
 import type { AIAnalysisResult } from '../ai/interface.js';
 import { Keys } from '../redis/schema.js';
+import type { PostMeta, RecoveryRecord, SpamScore } from '../redis/schema.js';
+import { computeSpamScore } from '../scoring/spamScore.js';
+import { isTitleDuplicate, isSelftextDuplicate, isDomainBanned, setSpamScore } from '../redis/posts.js';
+import { extractDomain, extractUrls } from '../utils/regex.js';
+import { formatWhyRemovedPM } from '../utils/pmTemplates.js';
 
 const KEYWORD_CMD = /^!keyword\s+(add|remove|list)\s*(.*)/i;
 const VOTE_CONFIG_CMD = /^!vote\s+config\b/i;
+const SHADOW_ACTIVATE_CMD = /^!shadow-activate\s+(.+)/i;
+const RECHECK_CMD = /\b!recheck\b/i;
+const RAID_CMD = /\b!raid\b/i;
 const DEFAULT_KEYWORDS = ['crypto', 'OnlyFans', 'free money', 'click here'];
+
+async function isModerator(context: TriggerContext, senderName: string): Promise<boolean> {
+  if (!senderName) return false;
+  const subredditName = context.subredditName ?? '';
+  const modListing = context.reddit.getModerators({ subredditName });
+  const allMods = await modListing.all();
+  return allMods.some((m) => m?.username?.toLowerCase() === senderName.toLowerCase());
+}
 
 async function handleKeywordCommand(
   context: TriggerContext,
@@ -231,6 +247,271 @@ async function handleVoteConfig(
   return true;
 }
 
+async function handleShadowActivate(
+  context: TriggerContext,
+  messageBody: string,
+  senderName: string,
+): Promise<boolean> {
+  const match = messageBody.trim().match(SHADOW_ACTIVATE_CMD);
+  if (!match) return false;
+
+  const subredditName = context.subredditName ?? '';
+  const allMods = await context.reddit.getModerators({ subredditName }).all();
+  const isMod = allMods.some((m) => m?.username?.toLowerCase() === senderName.toLowerCase());
+  if (!isMod) return false;
+
+  const keyword = (match[1] ?? '').trim().toLowerCase();
+  if (!keyword) return false;
+
+  const config = await getConfig(context.redis);
+  const shadowKeywords = config.shadowAudit?.keywords ?? [];
+
+  if (!shadowKeywords.some((k) => k.toLowerCase() === keyword)) {
+    await context.reddit.sendPrivateMessage({
+      to: senderName,
+      subject: 'SubGuardian — Shadow Activate',
+      text: `"${keyword}" is not in shadow-audit mode. Current shadow keywords: ${shadowKeywords.join(', ') || '(none)'}.`,
+    });
+    return true;
+  }
+
+  // Read shadow audit stats before clearing
+  const listKey = Keys.shadowAuditList(keyword);
+  const count = await context.redis.zCard(listKey);
+
+  // Move keyword from shadow to live banned keywords
+  const nextShadow = shadowKeywords.filter((k) => k.toLowerCase() !== keyword);
+  const nextBanned = [...config.spamDetection.bannedKeywords];
+  if (!nextBanned.some((k) => k.toLowerCase() === keyword)) {
+    nextBanned.push(keyword);
+  }
+
+  await setConfig(context.redis, {
+    ...config,
+    shadowAudit: {
+      ...config.shadowAudit,
+      keywords: nextShadow,
+      startedAt: nextShadow.length === 0 ? null : config.shadowAudit.startedAt,
+    },
+    spamDetection: { ...config.spamDetection, bannedKeywords: nextBanned },
+  });
+
+  // Delete the shadow audit list
+  await context.redis.del(listKey);
+
+  console.log(`[ShadowActivate] "${keyword}" promoted to live — caught ${count} posts in shadow mode`);
+
+  await context.reddit.sendPrivateMessage({
+    to: senderName,
+    subject: 'SubGuardian — Shadow Keyword Activated',
+    text: [
+      `✅ "${keyword}" has been promoted from Shadow-Audit to your active spam keyword list.`,
+      ``,
+      `It caught **${count}** post${count !== 1 ? 's' : ''} during the shadow-audit period.`,
+      ``,
+      `From now on, posts containing "${keyword}" will trigger your normal spam detection rules.`,
+    ].join('\n'),
+  });
+
+  return true;
+}
+
+async function computeCurrentSpamScore(
+  context: TriggerContext,
+  postId: string,
+): Promise<{ spamScore: SpamScore; title: string; authorName: string }> {
+  const redis = context.redis;
+  const config = await getConfig(redis);
+  const post = await context.reddit.getPostById(postId);
+  const postLike = post as unknown as { title?: string; selftext?: string; url?: string | null; authorName?: string };
+  const title = postLike.title ?? '';
+  const selftext = postLike.selftext ?? '';
+  const postUrl = postLike.url ?? null;
+  const domains = postUrl ? [postUrl] : extractUrls(selftext).map((u) => extractDomain(u) ?? '');
+  const domainBanned = await Promise.any(
+    domains.map((d) => isDomainBanned(redis, d).then((result) => result ? Promise.resolve(true) : Promise.reject()))
+  ).catch(() => false);
+
+  const metaRaw = await redis.get(Keys.postMeta(postId));
+  const meta = metaRaw ? (JSON.parse(metaRaw) as PostMeta) : null;
+  const trust = meta?.authorId ? await getTrustScore(redis, meta.authorId) : null;
+
+  const spamScore = computeSpamScore({
+    title,
+    selftext,
+    url: postUrl,
+    isTitleDuplicate: await isTitleDuplicate(redis, title),
+    isSelftextDuplicate: await isSelftextDuplicate(redis, selftext),
+    isDomainBanned: domainBanned,
+    userTrustScore: trust?.score ?? 300,
+    accountAgeDays: 0,
+  }, config);
+  await setSpamScore(redis, postId, spamScore);
+  return { spamScore, title, authorName: postLike.authorName ?? meta?.authorName ?? '' };
+}
+
+async function handleRecheck(
+  context: TriggerContext,
+  conversationId: string,
+  messageBody: string,
+  senderId: string,
+  senderName: string,
+): Promise<boolean> {
+  if (!RECHECK_CMD.test(messageBody)) return false;
+
+  const cooldownKey = `recheck:cooldown:${senderId || senderName}`;
+  const reserved = await context.redis.set(cooldownKey, '1', {
+    nx: true,
+    expiration: new Date(Date.now() + 10 * 60_000),
+  });
+  if (!reserved) {
+    await context.reddit.modMail.reply({
+      conversationId,
+      body: 'Please wait 10 minutes before requesting another recheck.',
+    });
+    return true;
+  }
+
+  const postId =
+    (await context.redis.get(Keys.postRecheck(conversationId))) ??
+    (await context.redis.get(Keys.postRecheckUser(senderId))) ??
+    (await context.redis.get(Keys.postRecheckUser(senderName)));
+
+  if (!postId) {
+    await context.reddit.modMail.reply({
+      conversationId,
+      body: 'I could not find a held post linked to this conversation. Please contact the mods directly.',
+    });
+    return true;
+  }
+
+  const recoveryRaw = await context.redis.get(Keys.postRecovery(postId));
+  if (recoveryRaw) {
+    const recovery = JSON.parse(recoveryRaw) as RecoveryRecord;
+    if (Date.now() > recovery.expiresAt) {
+      await context.reddit.modMail.reply({
+        conversationId,
+        body: 'The 24-hour review window has closed. Contact the mods directly.',
+      });
+      await logAction(context.redis, {
+        timestamp: Date.now(),
+        action: 'recovery_failed',
+        targetId: postId,
+        targetType: 'post',
+        actor: senderName || senderId,
+        reason: 'Recovery window expired',
+      });
+      return true;
+    }
+  }
+
+  const config = await getConfig(context.redis);
+  const { spamScore, title, authorName } = await computeCurrentSpamScore(context, postId);
+  if (spamScore.score < config.spamDetection.autoFlagThreshold && !spamScore.signals.includes('selftext_duplicate')) {
+    await context.reddit.approve(postId);
+    await context.redis.del(Keys.postRecovery(postId));
+    try {
+      await context.reddit.setPostFlair({
+        postId,
+        subredditName: context.subredditName ?? '',
+        text: '',
+      });
+    } catch { /* flair removal failed — non-fatal */ }
+    await context.reddit.modMail.reply({
+      conversationId,
+      body: "Your post passed recheck - it's now live.",
+    });
+    await logAction(context.redis, {
+      timestamp: Date.now(),
+      action: 'recovery_approved',
+      targetId: postId,
+      targetType: 'post',
+      actor: 'SubGuardian',
+      reason: `Recheck score ${spamScore.score.toFixed(2)}`,
+      score: spamScore.score,
+    });
+    return true;
+  }
+
+  await context.reddit.modMail.reply({
+    conversationId,
+    body: formatWhyRemovedPM(spamScore, config, authorName || senderName, title, context.subredditName ?? ''),
+  });
+  await logAction(context.redis, {
+    timestamp: Date.now(),
+    action: 'recovery_failed',
+    targetId: postId,
+    targetType: 'post',
+    actor: 'SubGuardian',
+    reason: `Recheck score ${spamScore.score.toFixed(2)}: ${spamScore.signals.join(', ')}`,
+    score: spamScore.score,
+  });
+  return true;
+}
+
+async function handleRaidCommand(
+  context: TriggerContext,
+  conversationId: string,
+  messageBody: string,
+  senderName: string,
+): Promise<boolean> {
+  if (!RAID_CMD.test(messageBody.trim())) return false;
+  if (!(await isModerator(context, senderName))) return false;
+
+  const config = await getConfig(context.redis);
+  await context.redis.set(Keys.raidMode, '1');
+  await context.redis.set('sub:raid_mode:activated_at', String(Date.now()));
+  await setPreset(context.redis, 'raid');
+  await context.reddit.modMail.reply({
+    conversationId,
+    body: `Raid preset activated. Raid mode will auto-expire in ${config.antiRaid.raidDurationHours}h or you can deactivate it from the Config UI.`,
+  });
+  await context.reddit.modMail.createConversation({
+    subredditName: context.subredditName ?? '',
+    subject: 'SubGuardian Raid Preset Activated',
+    body: `Raid preset activated by u/${senderName}.`,
+    isAuthorHidden: false,
+  });
+  await logAction(context.redis, {
+    timestamp: Date.now(),
+    action: 'raid_preset_activated',
+    targetId: 'raid',
+    targetType: 'config',
+    actor: senderName,
+    reason: 'Activated via !raid modmail command',
+  });
+  return true;
+}
+
+function formatAppealReply(
+  result: AIAnalysisResult,
+  appealText: string,
+  priorAppeals: number,
+): string {
+  const summaryLines = result.summary
+    .split(/[.!?]\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  const recommendation =
+    result.suggestedAction === 'approve' ? 'APPROVE' :
+    result.suggestedAction === 'remove' ? 'DENY' :
+    'REVIEW MANUALLY';
+  return [
+    '--- SubGuardian Appeal Analysis ---',
+    `Appeal history: ${priorAppeals === 0 ? 'First appeal on record' : `${priorAppeals + 1}th appeal on record`}`,
+    '',
+    'Summary:',
+    ...(summaryLines.length > 0 ? summaryLines.map((line) => `  - ${line}`) : ['  - No concise summary available.']),
+    '',
+    `Recommendation: ${recommendation} (confidence: ${Math.round(result.confidence * 100)}%)`,
+    `Reason: ${result.reasoning}`,
+    '',
+    '--- Original Appeal ---',
+    appealText,
+  ].join('\n');
+}
+
 export async function onModMail(event: TriggerEventType['ModMail'], context: TriggerContext): Promise<void> {
   const redis = context.redis;
   const conversationId = event.conversationId ?? `modmail:${Date.now()}`;
@@ -247,7 +528,10 @@ export async function onModMail(event: TriggerEventType['ModMail'], context: Tri
       ?? Object.values(allMessages).sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''))[0]?.bodyMarkdown
       ?? '';
     console.log(`[ModMail] messageId=${event.messageId} bodyPreview="${messageBody.slice(0, 80)}"`);
+    if (await handleRecheck(context, conversationId, messageBody, event.messageAuthor?.id ?? '', senderName)) return;
+    if (await handleRaidCommand(context, conversationId, messageBody, senderName)) return;
     if (await handleVoteConfig(context, conversationId, messageBody, senderName)) return;
+    if (await handleShadowActivate(context, messageBody, senderName)) return;
     if (await handleKeywordCommand(context, messageBody, senderName)) return;
   }
 
@@ -280,13 +564,15 @@ export async function onModMail(event: TriggerEventType['ModMail'], context: Tri
     const onCooldown = await isAppealOnCooldown(redis, senderId, config.appeals.cooldownDays);
 
     const ai = getAIProvider(config);
+    const activity = await getActivity(redis, senderId);
+    const appealLog = await getAppealLog(redis, senderId);
     const history = {
       trustScore,
-      removedPosts: 0,
-      tempBanCount: 0,
-      permBanHistory: 0,
-      appealCount: 0,
-      lastAppealTs: null,
+      removedPosts: activity.removedPosts,
+      tempBanCount: activity.tempBanCount,
+      permBanHistory: activity.permBanHistory,
+      appealCount: appealLog.length,
+      lastAppealTs: appealLog[0]?.timestamp ?? null,
     };
 
     // Check cache first (7-day TTL)
@@ -328,6 +614,11 @@ export async function onModMail(event: TriggerEventType['ModMail'], context: Tri
         reason: `Appeal within cooldown period (${config.appeals.cooldownDays} days)`,
       });
     }
+
+    await context.reddit.modMail.reply({
+      conversationId,
+      body: formatAppealReply(result, messageBody, appealLog.length),
+    });
 
     return;
   }

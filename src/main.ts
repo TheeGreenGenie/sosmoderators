@@ -18,6 +18,9 @@ import { sendModAlert } from './moderation/actions.js';
 import { getAuditLog } from './moderation/auditLog.js';
 import { getActivePreset, setPreset, getConfig } from './redis/config.js';
 import { renderApp, renderLoadingSpinner } from './ui/renders.js';
+import { getSpamScore } from './redis/posts.js';
+import { writeCaseRecord } from './ui/dashboard/CaseFile.js';
+import { buildCoachContext } from './ai/coachContext.js';
 
 // ─── Configure required permissions ─────────────────────────────────────────
 
@@ -45,6 +48,12 @@ Devvit.addSchedulerJob({ name: 'trust_decay', onRun: runTrustDecay });
 Devvit.addSchedulerJob({ name: 'raid_mode_expiry', onRun: runRaidModeExpiry });
 Devvit.addSchedulerJob({ name: 'flair_vote_tallier', onRun: runFlairVoteTallier });
 Devvit.addSchedulerJob({ name: 'weekly_highlight', onRun: runWeeklyHighlight });
+Devvit.addSchedulerJob({
+  name: 'coach_context_warmup',
+  onRun: async (_event, context) => {
+    await buildCoachContext(context.redis, context.subredditName ?? '');
+  },
+});
 
 Devvit.addSchedulerJob({
   name: 'retry_queue_drain',
@@ -140,6 +149,8 @@ Devvit.addMenuItem({
     const postId = event.targetId;
     const post = await context.reddit.getPostById(postId);
     await context.reddit.approve(postId);
+    const spam = await getSpamScore(context.redis, postId);
+    await writeCaseRecord(context, postId, post.title, spam?.signals ?? [], 'approved', 'Approved from mod menu');
     try {
       await context.reddit.sendPrivateMessage({
         to: post.authorName,
@@ -165,6 +176,8 @@ Devvit.addMenuItem({
     const postId = event.targetId;
     const post = await context.reddit.getPostById(postId);
     await context.reddit.remove(postId, true);
+    const spam = await getSpamScore(context.redis, postId);
+    await writeCaseRecord(context, postId, post.title, spam?.signals ?? [], 'removed', 'Removed from mod menu');
     try {
       await context.reddit.sendPrivateMessage({
         to: post.authorName,

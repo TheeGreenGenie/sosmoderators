@@ -1,5 +1,5 @@
 import type { RedisClient } from '@devvit/public-api';
-import type { SubConfig, AntiRaidConfig, SpamDetectionConfig, ReportHandlingConfig } from './schema.js';
+import type { SubConfig, AntiRaidConfig, SpamDetectionConfig, ReportHandlingConfig, ShadowAuditConfig, QuietHoursConfig } from './schema.js';
 import { Keys } from './schema.js';
 
 export const DEFAULT_CONFIG: SubConfig = {
@@ -58,6 +58,17 @@ export const DEFAULT_CONFIG: SubConfig = {
     reportAction: 20,
     ban: 5,
     global: 150,
+  },
+  shadowAudit: {
+    keywords: [],
+    thresholdTestActive: false,
+    thresholdTestValue: 0.65,
+    startedAt: null,
+  },
+  quietHours: {
+    enabled: false,
+    startHour: 22,
+    endHour: 7,
   },
 };
 
@@ -154,6 +165,8 @@ export async function getConfig(redis: RedisClient): Promise<SubConfig> {
       ...DEFAULT_CONFIG,
       ...stored,
       features: { ...DEFAULT_CONFIG.features, ...stored.features },
+      shadowAudit: { ...DEFAULT_CONFIG.shadowAudit, ...stored.shadowAudit } as ShadowAuditConfig,
+      quietHours: { ...DEFAULT_CONFIG.quietHours, ...stored.quietHours } as QuietHoursConfig,
     };
   } catch {
     return { ...DEFAULT_CONFIG };

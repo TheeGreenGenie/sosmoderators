@@ -14,6 +14,10 @@ export const Keys = {
   // Post / Content
   postReports: (postId: string) => `post:${postId}:reports`,
   postScore: (postId: string) => `post:${postId}:score`,
+  postMeta: (postId: string) => `post:${postId}:meta`,
+  postRecheck: (conversationId: string) => `post:recheck:${conversationId}`,
+  postRecheckUser: (userIdOrName: string) => `post:recheck:user:${userIdOrName.toLowerCase()}`,
+  postRecovery: (postId: string) => `post:recovery:${postId}`,
   cacheTitles: 'cache:titles',
   cacheDomains: 'cache:domains',
   cacheSelftextHashes: 'cache:selftext_hashes',
@@ -71,10 +75,22 @@ export const Keys = {
   weeklyHighlightPostId: 'sys:weekly_highlight:post_id',
   leaderboardPostId: 'sys:leaderboard:post_id',
 
+  // Coach (SubGuardian AI co-pilot)
+  coachLastEntity: (userId: string) => `coach:${userId}:last_entity`,
+  coachHistory: (userId: string) => `coach:${userId}:history`,
+  coachRateLimit: (userId: string) => `coach:ratelimit:${userId}`,
+
   // Hourly spike tracking
   hourlyPostCount: (hourKey: string) => `spike:posts:${hourKey}`,
   hourlyNewUsers: (hourKey: string) => `spike:newusers:${hourKey}`,
   hourlyToxicitySum: (hourKey: string) => `spike:toxicity:${hourKey}`,
+
+  // Shadow-Audit Mode
+  shadowAuditList: (keyword: string) => `audit:shadow:${keyword.toLowerCase().replace(/\s+/g, '_')}`,
+  shadowAuditDigestSent: (keyword: string) => `shadow:digest_sent:${keyword.toLowerCase().replace(/\s+/g, '_')}`,
+
+  // Modqueue case file
+  modCases: (signalBucket: string) => `mod:cases:${signalBucket || 'none'}`,
 } as const;
 
 /** Format a Date as YYYYMMDD for daily aggregate keys. */
@@ -144,6 +160,17 @@ export interface SpamScore {
   score: number;
   signals: string[];
   computedAt: number;
+}
+
+export interface PostMeta {
+  postId: string;
+  title: string;
+  selftext: string;
+  url: string | null;
+  authorId: string;
+  authorName: string;
+  permalink: string;
+  createdAt: number;
 }
 
 export interface ReportEntry {
@@ -238,6 +265,49 @@ export interface AIConfig {
   apiKey?: string;
 }
 
+export interface ShadowAuditConfig {
+  keywords: string[];           // keywords being tested in shadow mode
+  thresholdTestActive: boolean; // whether a candidate threshold is under test
+  thresholdTestValue: number;   // candidate threshold (only used when thresholdTestActive)
+  startedAt: number | null;     // epoch ms when shadow mode was last activated
+}
+
+export interface ShadowAuditEntry {
+  postId: string;
+  title: string;
+  score: number;
+  matchedKeyword: string;
+  timestamp: number;
+}
+
+export interface RecoveryRecord {
+  userId: string;
+  username: string;
+  originalScore: number;
+  expiresAt: number;
+}
+
+export interface CoachHistoryMessage {
+  role: 'user' | 'coach';
+  text: string;
+  timestamp: number;
+}
+
+export interface ModCaseRecord {
+  postId: string;
+  title: string;
+  decision: 'approved' | 'removed';
+  modNote: string;
+  actor: string;
+  timestamp: number;
+}
+
+export interface QuietHoursConfig {
+  enabled: boolean;
+  startHour: number;
+  endHour: number;
+}
+
 export interface SubConfig {
   antiRaid: AntiRaidConfig;
   spamDetection: SpamDetectionConfig;
@@ -273,4 +343,6 @@ export interface SubConfig {
     ban: number;
     global: number;
   };
+  shadowAudit: ShadowAuditConfig;
+  quietHours: QuietHoursConfig;
 }

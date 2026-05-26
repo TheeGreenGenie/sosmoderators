@@ -31,7 +31,8 @@ export async function runRedisMonitor(
       context,
       redis,
       'CRITICAL: Redis Storage Alert',
-      `Redis is at ${(pct * 100).toFixed(1)}% capacity (${estimatedMB.toFixed(1)} MB / 500 MB).\n\nEmergency eviction triggered: aggregate history trimmed to 30 days, AI cache cleared.`
+      `Redis is at ${(pct * 100).toFixed(1)}% capacity (${estimatedMB.toFixed(1)} MB / 500 MB).\n\nEmergency eviction triggered: aggregate history trimmed to 30 days, AI cache cleared.`,
+      true
     );
     return;
   }

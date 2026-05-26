@@ -19,7 +19,8 @@ export function computeWeightedReportCount(reports: ReportEntry[]): number {
 // High report/view ratio = organic community response, not CIB.
 // Low ratio + burst = small group coordinating reports on a widely-seen post.
 // viewCount=0 (new/test posts): burst alone is sufficient.
-export function detectCIB(reports: ReportEntry[], viewCount: number): CIBResult {
+export function detectCIB(reports: ReportEntry[], viewCountOrAccountAges: number | number[]): CIBResult {
+  const viewCount = Array.isArray(viewCountOrAccountAges) ? 0 : viewCountOrAccountAges;
   const reportCount = reports.length;
   if (reportCount < CIB.MIN_BURST_COUNT) {
     return { isCIB: false, isBurst: false, reportCount };

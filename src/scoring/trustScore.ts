@@ -13,7 +13,7 @@ export interface TrustInputData {
   awardsReceived: number;
   topPostCount: number;
   helpfulReportCount: number;
-  proposedFlairsAdopted: number;
+  proposedFlairsAdopted?: number;
 }
 
 export function computeTrustComponents(data: TrustInputData): TrustComponents {
@@ -22,13 +22,16 @@ export function computeTrustComponents(data: TrustInputData): TrustComponents {
   const subKarma = Math.min(Math.log10(Math.max(data.subKarma, 1)) * 40, 120);
 
   // 15 points per approved post, capped at 150 — gradual accumulation
-  const approvalRate = Math.min(data.approvedSubPosts * 15, 150);
+  const graceBonusActive = data.totalSubPosts < TRUST.GRACE_POST_THRESHOLD;
+  const approvalRate = graceBonusActive
+    ? Math.max(75, Math.min(data.approvedSubPosts * 15, 150))
+    : Math.min(data.approvedSubPosts * 15, 150);
 
   const positiveSignals = Math.min(
     data.awardsReceived * 10 +
       data.topPostCount * 5 +
       data.helpfulReportCount * 3 +
-      data.proposedFlairsAdopted * 15,
+      (data.proposedFlairsAdopted ?? 0) * 15,
     100
   );
 
@@ -46,7 +49,7 @@ export function computeTrustComponents(data: TrustInputData): TrustComponents {
     approvalRate,
     positiveSignals,
     penalties,
-    graceBonusActive: false,
+    graceBonusActive,
   };
 }
 
