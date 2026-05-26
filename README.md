@@ -6,6 +6,15 @@ SubGuardian is an automated moderation assistant for Reddit subreddits. It handl
 
 ---
 
+## Deck & Slides
+
+| Format | Link |
+|--------|------|
+| PDF | [SOSModerators_Deck.pdf](infoFiles/SOSModerators_Deck.pdf) |
+| PowerPoint | [SOSModerators_Deck.pptx](infoFiles/SOSModerators_Deck.pptx) |
+
+---
+
 ## What SubGuardian Does
 
 ### Spam Filtering
