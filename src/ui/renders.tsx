@@ -5,7 +5,6 @@ import { UserLeaderboard } from './dashboard/UserLeaderboard.js';
 import { ContentInterests } from './dashboard/ContentInterests.js';
 import { PostPerformance } from './dashboard/PostPerformance.js';
 import { CoachTab } from './dashboard/Coach.js';
-import type { FlaggedPostItem } from './dashboard/CaseFile.js';
 import { renderFlairVotePost } from './FlairVotePost.js';
 import { renderLeaderboardPost } from './LeaderboardPost.js';
 import { Keys, weekKey } from '../redis/schema.js';
@@ -32,7 +31,25 @@ export function renderApp(context: Context): JSX.Element {
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 
+function ModAccessDenied(): JSX.Element {
+  return (
+    <vstack height="100%" width="100%" alignment="center middle" gap="medium" backgroundColor="neutral-background">
+      <text size="xlarge">🔒</text>
+      <text size="large" weight="bold">Moderators Only</text>
+      <text size="small" color="neutral-content-weak" alignment="center middle">
+        This panel is restricted to subreddit moderators.
+      </text>
+    </vstack>
+  );
+}
+
 export function renderDashboard(context: Context): JSX.Element {
+  const [isMod] = context.useState(async () => {
+    if (!context.userId) return false;
+    const mods = await context.reddit.getModerators({ subredditName: context.subredditName ?? '' }).all();
+    return mods.some((m) => m.id === context.userId);
+  });
+
   const [activeTab, setActiveTab] = context.useState<DashboardTab>('health');
 
   const [health] = context.useState(async () => {
@@ -95,18 +112,6 @@ export function renderDashboard(context: Context): JSX.Element {
     }
   });
 
-  const [flaggedPostsJson] = context.useState(async () => {
-    const raw = await context.redis.get('dashboard:flagged_posts');
-    if (!raw) return JSON.stringify([]);
-    const posts = JSON.parse(raw) as FlaggedPostItem[];
-    const hydrated = await Promise.all(posts.slice(0, 25).map(async (p) => ({
-      ...p,
-      recovery: !!(await context.redis.get(Keys.postRecovery(p.id))),
-    })));
-    return JSON.stringify(hydrated);
-  });
-  const flaggedPosts = JSON.parse(flaggedPostsJson) as FlaggedPostItem[];
-
   async function fetchLeaderboard() {
     const members = (await context.redis.zRange(Keys.leaderboardTrust, 0, 24, { by: 'rank', reverse: true }))
       .filter((m) => m.member.startsWith('t2_'));
@@ -127,6 +132,8 @@ export function renderDashboard(context: Context): JSX.Element {
 
   const [leaderboard, setLeaderboard] = context.useState(fetchLeaderboard);
 
+  if (!isMod) return ModAccessDenied();
+
   const dashTabs: { id: DashboardTab; label: string }[] = [
     { id: 'health', label: 'Health' },
     { id: 'topics', label: 'Topics' },
@@ -134,6 +141,67 @@ export function renderDashboard(context: Context): JSX.Element {
     { id: 'posts', label: 'Posts' },
     { id: 'coach', label: 'Coach' },
   ];
+
+  async function handlePutToVote(topic: string): Promise<void> {
+    const cfg = await getConfig(context.redis);
+    const existingListRaw = await context.redis.get(Keys.flairProposalList);
+    const existingList: string[] = existingListRaw ? (JSON.parse(existingListRaw) as string[]) : [];
+    for (const eid of existingList) {
+      const eRaw = await context.redis.get(Keys.flairProposal(eid));
+      if (!eRaw) continue;
+      const ep = JSON.parse(eRaw) as FlairProposal;
+      if (ep.status === 'active') {
+        ep.status = 'superseded';
+        await context.redis.set(Keys.flairProposal(eid), JSON.stringify(ep));
+      }
+    }
+    await context.redis.set(Keys.flairProposalList, JSON.stringify([]));
+    const proposalId = `prop_${Date.now()}`;
+    const userId = context.userId ?? '';
+    const username = userId ? ((await context.redis.get(Keys.userUsername(userId))) ?? 'mod') : 'mod';
+    const proposal: FlairProposal = {
+      id: proposalId,
+      flair: topic,
+      proposedByUserId: userId,
+      proposedByUsername: username,
+      createdAt: Date.now(),
+      endsAt: Date.now() + cfg.flairVoting.votingPeriodHours * 3_600_000,
+      status: 'active',
+      postId: '',
+    };
+    const configConv = await context.reddit.modMail.createConversation({
+      subredditName: context.subredditName ?? '',
+      subject: `SubGuardian: configure vote for "${topic}" flair`,
+      body: [
+        `A community vote has been staged for the **"${topic}"** flair.`,
+        ``,
+        `**No posts have been made yet.** Reply to this message to configure and publish.`,
+        ``,
+        `**Current defaults:**`,
+        `- Duration: ${cfg.flairVoting.votingPeriodHours} hours`,
+        `- Approval threshold: ${Math.round(cfg.flairVoting.approvalRatio * 100)}%`,
+        `- Minimum votes (quorum): ${cfg.flairVoting.minVotes > 0 ? cfg.flairVoting.minVotes : 'none'}`,
+        ``,
+        `To use the defaults as-is, reply: \`!vote config\``,
+        `To override: \`!vote config hours:48 threshold:0.7 minVotes:10\``,
+        `*SubGuardian will create the vote post upon receiving your reply.*`,
+      ].join('\n'),
+      isAuthorHidden: false,
+    });
+    proposal.configConversationId = configConv.conversation?.id ?? undefined;
+    await context.redis.set(Keys.flairProposal(proposalId), JSON.stringify(proposal));
+    const listRaw = await context.redis.get(Keys.flairProposalList);
+    const list: string[] = listRaw ? (JSON.parse(listRaw) as string[]) : [];
+    list.push(proposalId);
+    await context.redis.set(Keys.flairProposalList, JSON.stringify(list));
+    const wk = weekKey();
+    if (userId) await context.redis.zIncrBy(Keys.leaderboardContributionsWeekly(wk), userId, 2);
+    context.ui.showToast(`Vote staged — reply to the modmail to publish.`);
+  }
+
+  // Always call components with useState to keep hook order stable across tab switches.
+  const postsPanel = PostPerformance(context, topPosts, []);
+  const coachPanel = CoachTab(context);
 
   return (
     <vstack height="100%" width="100%">
@@ -168,81 +236,10 @@ export function renderDashboard(context: Context): JSX.Element {
             }
             context.ui.showToast(`"${topic}" added as a flair.`);
           },
-          onPutToVote: async (topic) => {
-            const cfg = await getConfig(context.redis);
-
-            // Mark any active proposals as superseded and clear the list
-            const existingListRaw = await context.redis.get(Keys.flairProposalList);
-            const existingList: string[] = existingListRaw ? (JSON.parse(existingListRaw) as string[]) : [];
-            for (const eid of existingList) {
-              const eRaw = await context.redis.get(Keys.flairProposal(eid));
-              if (!eRaw) continue;
-              const ep = JSON.parse(eRaw) as FlairProposal;
-              if (ep.status === 'active') {
-                ep.status = 'superseded';
-                await context.redis.set(Keys.flairProposal(eid), JSON.stringify(ep));
-              }
-            }
-            // Start with a clean list — only the new proposal will be added below
-            await context.redis.set(Keys.flairProposalList, JSON.stringify([]));
-
-            const proposalId = `prop_${Date.now()}`;
-            const userId = context.userId ?? '';
-            const username = userId
-              ? ((await context.redis.get(Keys.userUsername(userId))) ?? 'mod')
-              : 'mod';
-            const proposal: FlairProposal = {
-              id: proposalId,
-              flair: topic,
-              proposedByUserId: userId,
-              proposedByUsername: username,
-              createdAt: Date.now(),
-              endsAt: Date.now() + cfg.flairVoting.votingPeriodHours * 3_600_000,
-              status: 'active',
-              postId: '',
-            };
-            // Send modmail first — no posts are created until the mod replies
-            const configConv = await context.reddit.modMail.createConversation({
-              subredditName: context.subredditName ?? '',
-              subject: `SubGuardian: configure vote for "${topic}" flair`,
-              body: [
-                `A community vote has been staged for the **"${topic}"** flair.`,
-                ``,
-                `**No posts have been made yet.** Reply to this message to configure and publish.`,
-                ``,
-                `**Current defaults:**`,
-                `- Duration: ${cfg.flairVoting.votingPeriodHours} hours`,
-                `- Approval threshold: ${Math.round(cfg.flairVoting.approvalRatio * 100)}%`,
-                `- Minimum votes (quorum): ${cfg.flairVoting.minVotes > 0 ? cfg.flairVoting.minVotes : 'none'}`,
-                ``,
-                `To use the defaults as-is, reply with just:`,
-                `\`\`\``,
-                `!vote config`,
-                `\`\`\``,
-                `To override any setting, include the values you want to change:`,
-                `\`\`\``,
-                `!vote config hours:48 threshold:0.7 minVotes:10`,
-                `\`\`\``,
-                `*SubGuardian will create the vote post and notify members upon receiving your reply.*`,
-              ].join('\n'),
-              isAuthorHidden: false,
-            });
-            proposal.configConversationId = configConv.conversation?.id ?? undefined;
-
-            // Save proposal and list — posts created in handleVoteConfig after mod replies
-            await context.redis.set(Keys.flairProposal(proposalId), JSON.stringify(proposal));
-            const listRaw = await context.redis.get(Keys.flairProposalList);
-            const list: string[] = listRaw ? (JSON.parse(listRaw) as string[]) : [];
-            list.push(proposalId);
-            await context.redis.set(Keys.flairProposalList, JSON.stringify(list));
-
-            const wk = weekKey();
-            if (userId) await context.redis.zIncrBy(Keys.leaderboardContributionsWeekly(wk), userId, 2);
-            context.ui.showToast(`Vote staged — reply to the modmail to publish.`);
-          },
+          onPutToVote: handlePutToVote,
         })}
-        {activeTab === 'posts' && PostPerformance(context, topPosts, [])}
-        {activeTab === 'coach' && CoachTab(context)}
+        {activeTab === 'posts' && postsPanel}
+        {activeTab === 'coach' && coachPanel}
       </vstack>
     </vstack>
   );
@@ -252,7 +249,15 @@ export function renderDashboard(context: Context): JSX.Element {
 
 export function renderConfig(context: Context): JSX.Element {
   const redis = context.redis;
+
+  const [isMod] = context.useState(async () => {
+    if (!context.userId) return false;
+    const mods = await context.reddit.getModerators({ subredditName: context.subredditName ?? '' }).all();
+    return mods.some((m) => m.id === context.userId);
+  });
+
   const [activeTab, setActiveTab] = context.useState<ConfigTab>('presets');
+  const [collapsedSections, setCollapsedSections] = context.useState<string[]>(() => []);
 
   const [stateJson, setStateJson] = context.useState(async () => {
     const [config, killSwitchOn] = await Promise.all([
@@ -262,12 +267,14 @@ export function renderConfig(context: Context): JSX.Element {
     return JSON.stringify({ config, killSwitchOn });
   });
 
+  if (!isMod) return ModAccessDenied();
+
   const parsed = stateJson
     ? JSON.parse(stateJson) as { config: SubConfig; killSwitchOn: boolean }
     : null;
 
   async function saveConfig(updated: SubConfig) {
-    await saveConfig(updated);
+    await setConfig(redis, updated);
     setStateJson(JSON.stringify({ config: updated, killSwitchOn: parsed?.killSwitchOn ?? false }));
   }
 
@@ -357,251 +364,289 @@ export function renderConfig(context: Context): JSX.Element {
           modmailRouting: 'Modmail Routing',
         };
         const entries = Object.entries(parsed.config.features) as [string, boolean][];
+        const featureTriplets: [string, boolean][][] = [];
+        for (let i = 0; i < entries.length; i += 3) {
+          featureTriplets.push(entries.slice(i, i + 3) as [string, boolean][]);
+        }
         return (
-          <vstack gap="small" padding="medium" grow>
-            {entries.map(([feature, enabled]) => (
-              <hstack
-                key={feature}
-                backgroundColor="neutral-background"
-                padding="medium"
-                cornerRadius="medium"
-                alignment="start middle"
-              >
-                <vstack grow gap="small">
-                  <text weight="bold" size="small">{FEATURE_LABELS[feature] ?? feature}</text>
-                </vstack>
-                <button
-                  size="small"
-                  appearance={enabled ? 'primary' : 'secondary'}
-                  onPress={async () => {
-                    const updated = { ...parsed.config, features: { ...parsed.config.features, [feature]: !enabled } };
-                    await saveConfig(updated);
-                    context.ui.showToast(`${FEATURE_LABELS[feature] ?? feature} ${!enabled ? 'enabled' : 'disabled'}`);
-                  }}
-                >
-                  {enabled ? 'ON' : 'OFF'}
-                </button>
+          <vstack gap="small" padding="small" grow>
+            {featureTriplets.map((triplet, ri) => (
+              <hstack key={`row-${ri}`} gap="small">
+                {triplet.map(([feature, enabled]) => (
+                  <vstack
+                    key={feature}
+                    grow
+                    backgroundColor="neutral-background"
+                    padding="small"
+                    cornerRadius="medium"
+                    gap="small"
+                    alignment="center middle"
+                  >
+                    <text weight="bold" size="xsmall" alignment="center middle">{FEATURE_LABELS[feature] ?? feature}</text>
+                    <button
+                      size="small"
+                      appearance={enabled ? 'primary' : 'secondary'}
+                      onPress={async () => {
+                        const updated = { ...parsed.config, features: { ...parsed.config.features, [feature]: !enabled } };
+                        await saveConfig(updated);
+                        context.ui.showToast(`${FEATURE_LABELS[feature] ?? feature} ${!enabled ? 'enabled' : 'disabled'}`);
+                      }}
+                    >
+                      {enabled ? 'ON' : 'OFF'}
+                    </button>
+                  </vstack>
+                ))}
+                {triplet.length === 2 && <vstack grow />}
+                {triplet.length === 1 && <vstack grow />}
+                {triplet.length === 1 && <vstack grow />}
               </hstack>
             ))}
           </vstack>
         );
       })()}
 
-      {parsed && activeTab === 'thresholds' && (
-        <vstack gap="medium" padding="medium" grow>
-          <text weight="bold">Spam Detection Thresholds</text>
-          <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
-            <hstack alignment="start middle">
-              <text grow size="small">Auto-Flag threshold</text>
-              <text size="small" weight="bold">{parsed.config.spamDetection.autoFlagThreshold.toFixed(2)}</text>
-            </hstack>
-            <hstack gap="small">
-              {[0.30, 0.40, 0.50, 0.65, 0.75].map((v) => (
-                <button
-                  key={String(v)}
-                  size="small"
-                  appearance={parsed.config.spamDetection.autoFlagThreshold === v ? 'primary' : 'secondary'}
-                  onPress={async () => {
-                    const updated = { ...parsed.config, spamDetection: { ...parsed.config.spamDetection, autoFlagThreshold: v } };
-                    await saveConfig(updated);
-                    context.ui.showToast(`Flag threshold set to ${v}`);
-                  }}
-                >
-                  {String(v)}
-                </button>
-              ))}
-            </hstack>
-            <hstack alignment="start middle" gap="small">
-              <text grow size="small" color="neutral-content-weak">
-                Shadow-test candidate threshold: {parsed.config.shadowAudit.thresholdTestValue.toFixed(2)}
-              </text>
-              <button
-                size="small"
-                appearance={parsed.config.shadowAudit.thresholdTestActive ? 'primary' : 'secondary'}
-                onPress={async () => {
-                  const updated = {
-                    ...parsed.config,
-                    shadowAudit: {
-                      ...parsed.config.shadowAudit,
-                      thresholdTestActive: !parsed.config.shadowAudit.thresholdTestActive,
-                      startedAt: !parsed.config.shadowAudit.thresholdTestActive ? Date.now() : parsed.config.shadowAudit.startedAt,
-                    },
-                  };
-                  await saveConfig(updated);
-                  context.ui.showToast(`Shadow threshold test ${updated.shadowAudit.thresholdTestActive ? 'enabled' : 'disabled'}`);
-                }}
-              >
-                {parsed.config.shadowAudit.thresholdTestActive ? 'Testing' : 'Test Mode'}
+      {parsed && activeTab === 'thresholds' && (() => {
+        const toggle = (id: string) => setCollapsedSections(
+          collapsedSections.includes(id)
+            ? collapsedSections.filter((s) => s !== id)
+            : [...collapsedSections, id],
+        );
+        const isOpen = (id: string) => !collapsedSections.includes(id);
+
+        return (
+          <vstack gap="small" padding="small" grow>
+
+            {/* ── Detection Thresholds ── */}
+            <hstack
+              backgroundColor="neutral-background-selected"
+              padding="small"
+              cornerRadius="medium"
+              alignment="start middle"
+              gap="small"
+            >
+              <text size="small" weight="bold" grow>Detection Thresholds</text>
+              <button size="small" appearance="secondary" onPress={() => toggle('detection')}>
+                {isOpen('detection') ? '−' : '+'}
               </button>
             </hstack>
-          </vstack>
-          <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
-            <hstack alignment="start middle">
-              <text grow size="small">Auto-Remove threshold</text>
-              <text size="small" weight="bold">{parsed.config.spamDetection.autoRemoveThreshold.toFixed(2)}</text>
-            </hstack>
-            <hstack gap="small">
-              {[0.60, 0.70, 0.75, 0.85, 0.95].map((v) => (
-                <button
-                  key={String(v)}
-                  size="small"
-                  appearance={parsed.config.spamDetection.autoRemoveThreshold === v ? 'primary' : 'secondary'}
-                  onPress={async () => {
-                    const updated = { ...parsed.config, spamDetection: { ...parsed.config.spamDetection, autoRemoveThreshold: v } };
-                    await saveConfig(updated);
-                    context.ui.showToast(`Remove threshold set to ${v}`);
-                  }}
-                >
-                  {String(v)}
-                </button>
-              ))}
-            </hstack>
-          </vstack>
-          <text weight="bold">Banned Keywords</text>
-          <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
-            <hstack gap="small">
-              {['crypto', 'OnlyFans', 'free money', 'click here'].map((kw) => (
-                <vstack key={kw} gap="small">
+            {isOpen('detection') && (
+              <vstack backgroundColor="neutral-background" padding="small" cornerRadius="medium" gap="small">
+                <hstack alignment="start middle">
+                  <text grow size="small">Auto-Flag</text>
+                  <text size="small" weight="bold">{parsed.config.spamDetection.autoFlagThreshold.toFixed(2)}</text>
+                </hstack>
+                <hstack gap="small">
+                  {[0.30, 0.40, 0.50, 0.65, 0.75].map((v) => (
+                    <button
+                      key={String(v)}
+                      size="small"
+                      appearance={parsed.config.spamDetection.autoFlagThreshold === v ? 'primary' : 'secondary'}
+                      onPress={async () => {
+                        const updated = { ...parsed.config, spamDetection: { ...parsed.config.spamDetection, autoFlagThreshold: v } };
+                        await saveConfig(updated);
+                        context.ui.showToast(`Flag threshold → ${v}`);
+                      }}
+                    >
+                      {String(v)}
+                    </button>
+                  ))}
+                </hstack>
+                <hstack alignment="start middle">
+                  <text grow size="small">Auto-Remove</text>
+                  <text size="small" weight="bold">{parsed.config.spamDetection.autoRemoveThreshold.toFixed(2)}</text>
+                </hstack>
+                <hstack gap="small">
+                  {[0.60, 0.70, 0.75, 0.85, 0.95].map((v) => (
+                    <button
+                      key={String(v)}
+                      size="small"
+                      appearance={parsed.config.spamDetection.autoRemoveThreshold === v ? 'primary' : 'secondary'}
+                      onPress={async () => {
+                        const updated = { ...parsed.config, spamDetection: { ...parsed.config.spamDetection, autoRemoveThreshold: v } };
+                        await saveConfig(updated);
+                        context.ui.showToast(`Remove threshold → ${v}`);
+                      }}
+                    >
+                      {String(v)}
+                    </button>
+                  ))}
+                </hstack>
+                <hstack alignment="start middle" gap="small">
+                  <text grow size="xsmall" color="neutral-content-weak">
+                    Shadow-test value: {parsed.config.shadowAudit.thresholdTestValue.toFixed(2)}
+                  </text>
                   <button
                     size="small"
-                    appearance={parsed.config.spamDetection.bannedKeywords.includes(kw) ? 'primary' : 'secondary'}
+                    appearance={parsed.config.shadowAudit.thresholdTestActive ? 'primary' : 'secondary'}
                     onPress={async () => {
-                      const current = parsed.config.spamDetection.bannedKeywords;
-                      const next = current.includes(kw)
-                        ? current.filter((k) => k !== kw)
-                        : [...current, kw];
-                      const updated = { ...parsed.config, spamDetection: { ...parsed.config.spamDetection, bannedKeywords: next } };
-                      await saveConfig(updated);
-                      context.ui.showToast(`${kw} ${current.includes(kw) ? 'removed' : 'added'}`);
-                    }}
-                  >
-                    {kw}
-                  </button>
-                  <button
-                    size="small"
-                    appearance={parsed.config.shadowAudit.keywords.includes(kw) ? 'primary' : 'secondary'}
-                    onPress={async () => {
-                      const shadow = parsed.config.shadowAudit.keywords;
-                      const nextShadow = shadow.includes(kw)
-                        ? shadow.filter((k) => k !== kw)
-                        : [...shadow, kw];
                       const updated = {
                         ...parsed.config,
                         shadowAudit: {
                           ...parsed.config.shadowAudit,
-                          keywords: nextShadow,
-                          startedAt: nextShadow.length > 0 ? (parsed.config.shadowAudit.startedAt ?? Date.now()) : null,
+                          thresholdTestActive: !parsed.config.shadowAudit.thresholdTestActive,
+                          startedAt: !parsed.config.shadowAudit.thresholdTestActive ? Date.now() : parsed.config.shadowAudit.startedAt,
                         },
                       };
                       await saveConfig(updated);
-                      context.ui.showToast(`${kw} shadow test ${shadow.includes(kw) ? 'stopped' : 'started'}`);
+                      context.ui.showToast(`Shadow test ${updated.shadowAudit.thresholdTestActive ? 'on' : 'off'}`);
                     }}
                   >
-                    Test
+                    {parsed.config.shadowAudit.thresholdTestActive ? 'Testing' : 'Test Mode'}
                   </button>
-                </vstack>
-              ))}
-            </hstack>
-            {parsed.config.shadowAudit.keywords.length > 0 ? (
-              <text size="small" color="#ffaa00">
-                Active shadow tests: {parsed.config.shadowAudit.keywords.join(', ')} | {Math.max(0, 24 - Math.floor((Date.now() - (parsed.config.shadowAudit.startedAt ?? Date.now())) / 3_600_000))}h left
-              </text>
-            ) : null}
-            {(() => {
-              const defaults = ['crypto', 'onfans', 'free money', 'click here'];
-              const customCount = parsed.config.spamDetection.bannedKeywords.filter(
-                (k) => !defaults.includes(k.toLowerCase())
-              ).length;
-              return (
-                <text size="small" color="neutral-content-weak">
-                  {customCount > 0 ? `+${customCount} custom` : 'No custom keywords'} — add via modmail: !keyword add word
-                </text>
-              );
-            })()}
-          </vstack>
-          <text weight="bold">Flair Voting</text>
-          <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
-            <hstack alignment="start middle">
-              <text grow size="small">Min trust score to vote</text>
-              <text size="small" weight="bold">{parsed.config.flairVoting.minTrustToVote}</text>
-            </hstack>
-            <hstack gap="small">
-              {[100, 200, 300, 400, 500].map((v) => (
-                <button
-                  key={String(v)}
-                  size="small"
-                  appearance={parsed.config.flairVoting.minTrustToVote === v ? 'primary' : 'secondary'}
-                  onPress={async () => {
-                    const updated = { ...parsed.config, flairVoting: { ...parsed.config.flairVoting, minTrustToVote: v } };
-                    await saveConfig(updated);
-                    context.ui.showToast(`Min trust to vote set to ${v}`);
-                  }}
-                >
-                  {String(v)}
-                </button>
-              ))}
-            </hstack>
-            <text size="small" color="neutral-content-weak">Users below this score cannot cast flair votes.</text>
-          </vstack>
-          <text weight="bold">Quiet Hours</text>
-          <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
-            <hstack alignment="start middle">
-              <text grow size="small">Pause non-critical modmail</text>
-              <button
-                size="small"
-                appearance={parsed.config.quietHours.enabled ? 'primary' : 'secondary'}
-                onPress={async () => {
-                  const updated = {
-                    ...parsed.config,
-                    quietHours: { ...parsed.config.quietHours, enabled: !parsed.config.quietHours.enabled },
-                  };
-                  await saveConfig(updated);
-                  context.ui.showToast(`Quiet hours ${updated.quietHours.enabled ? 'enabled' : 'disabled'}`);
-                }}
-              >
-                {parsed.config.quietHours.enabled ? 'ON' : 'OFF'}
+                </hstack>
+              </vstack>
+            )}
+
+            {/* ── Banned Keywords ── */}
+            <hstack
+              backgroundColor="neutral-background-selected"
+              padding="small"
+              cornerRadius="medium"
+              alignment="start middle"
+              gap="small"
+            >
+              <text size="small" weight="bold" grow>Banned Keywords</text>
+              <button size="small" appearance="secondary" onPress={() => toggle('keywords')}>
+                {isOpen('keywords') ? '−' : '+'}
               </button>
             </hstack>
-            <hstack gap="small">
-              {[20, 22, 23].map((h) => (
-                <button
-                  key={`start-${h}`}
-                  size="small"
-                  appearance={parsed.config.quietHours.startHour === h ? 'primary' : 'secondary'}
-                  onPress={async () => {
-                    await saveConfig({ ...parsed.config, quietHours: { ...parsed.config.quietHours, startHour: h } });
-                    context.ui.showToast(`Quiet hours start at ${h}:00 UTC`);
-                  }}
-                >
-                  {h}:00
-                </button>
-              ))}
-              {[6, 7, 8].map((h) => (
-                <button
-                  key={`end-${h}`}
-                  size="small"
-                  appearance={parsed.config.quietHours.endHour === h ? 'primary' : 'secondary'}
-                  onPress={async () => {
-                    await saveConfig({ ...parsed.config, quietHours: { ...parsed.config.quietHours, endHour: h } });
-                    context.ui.showToast(`Quiet hours end at ${h}:00 UTC`);
-                  }}
-                >
-                  {h}:00
-                </button>
-              ))}
+            {isOpen('keywords') && (
+              <vstack backgroundColor="neutral-background" padding="small" cornerRadius="medium" gap="small">
+                <hstack gap="small">
+                  {['crypto', 'OnlyFans', 'free money', 'click here'].map((kw) => (
+                    <vstack key={kw} gap="small">
+                      <button
+                        size="small"
+                        appearance={parsed.config.spamDetection.bannedKeywords.includes(kw) ? 'primary' : 'secondary'}
+                        onPress={async () => {
+                          const current = parsed.config.spamDetection.bannedKeywords;
+                          const next = current.includes(kw) ? current.filter((k) => k !== kw) : [...current, kw];
+                          await saveConfig({ ...parsed.config, spamDetection: { ...parsed.config.spamDetection, bannedKeywords: next } });
+                          context.ui.showToast(`${kw} ${current.includes(kw) ? 'removed' : 'added'}`);
+                        }}
+                      >
+                        {kw}
+                      </button>
+                      <button
+                        size="small"
+                        appearance={parsed.config.shadowAudit.keywords.includes(kw) ? 'primary' : 'secondary'}
+                        onPress={async () => {
+                          const shadow = parsed.config.shadowAudit.keywords;
+                          const nextShadow = shadow.includes(kw) ? shadow.filter((k) => k !== kw) : [...shadow, kw];
+                          await saveConfig({
+                            ...parsed.config,
+                            shadowAudit: { ...parsed.config.shadowAudit, keywords: nextShadow, startedAt: nextShadow.length > 0 ? (parsed.config.shadowAudit.startedAt ?? Date.now()) : null },
+                          });
+                          context.ui.showToast(`${kw} shadow test ${shadow.includes(kw) ? 'stopped' : 'started'}`);
+                        }}
+                      >
+                        Test
+                      </button>
+                    </vstack>
+                  ))}
+                </hstack>
+                {parsed.config.shadowAudit.keywords.length > 0 && (
+                  <text size="xsmall" color="#ffaa00">
+                    Shadow: {parsed.config.shadowAudit.keywords.join(', ')} · {Math.max(0, 24 - Math.floor((Date.now() - (parsed.config.shadowAudit.startedAt ?? Date.now())) / 3_600_000))}h left
+                  </text>
+                )}
+                <text size="xsmall" color="neutral-content-weak">
+                  {parsed.config.spamDetection.bannedKeywords.length} active · add via modmail: !keyword add word
+                </text>
+              </vstack>
+            )}
+
+            {/* ── Flair Voting ── */}
+            <hstack
+              backgroundColor="neutral-background-selected"
+              padding="small"
+              cornerRadius="medium"
+              alignment="start middle"
+              gap="small"
+            >
+              <text size="small" weight="bold" grow>Flair Voting</text>
+              <text size="xsmall" color="neutral-content-weak">min trust: {parsed.config.flairVoting.minTrustToVote}  </text>
+              <button size="small" appearance="secondary" onPress={() => toggle('flair')}>
+                {isOpen('flair') ? '−' : '+'}
+              </button>
             </hstack>
-            <text size="small" color="neutral-content-weak">
-              Current: {parsed.config.quietHours.startHour}:00-{parsed.config.quietHours.endHour}:00 UTC. Critical alerts still deliver.
-            </text>
+            {isOpen('flair') && (
+              <vstack backgroundColor="neutral-background" padding="small" cornerRadius="medium" gap="small">
+                <hstack gap="small">
+                  {[100, 200, 300, 400, 500].map((v) => (
+                    <button
+                      key={String(v)}
+                      size="small"
+                      appearance={parsed.config.flairVoting.minTrustToVote === v ? 'primary' : 'secondary'}
+                      onPress={async () => {
+                        await saveConfig({ ...parsed.config, flairVoting: { ...parsed.config.flairVoting, minTrustToVote: v } });
+                        context.ui.showToast(`Min trust to vote → ${v}`);
+                      }}
+                    >
+                      {String(v)}
+                    </button>
+                  ))}
+                </hstack>
+                <text size="xsmall" color="neutral-content-weak">Users below this score cannot cast flair votes.</text>
+              </vstack>
+            )}
+
+            {/* ── Quiet Hours ── */}
+            <hstack
+              backgroundColor="neutral-background-selected"
+              padding="small"
+              cornerRadius="medium"
+              alignment="start middle"
+              gap="small"
+            >
+              <text size="small" weight="bold" grow>Quiet Hours</text>
+              <text size="xsmall" color="neutral-content-weak">{parsed.config.quietHours.startHour}:00–{parsed.config.quietHours.endHour}:00  </text>
+              <button size="small" appearance="secondary" onPress={() => toggle('quiet')}>
+                {isOpen('quiet') ? '−' : '+'}
+              </button>
+            </hstack>
+            {isOpen('quiet') && (
+              <vstack backgroundColor="neutral-background" padding="small" cornerRadius="medium" gap="small">
+                <hstack alignment="start middle">
+                  <text grow size="small">Pause non-critical modmail</text>
+                  <button
+                    size="small"
+                    appearance={parsed.config.quietHours.enabled ? 'primary' : 'secondary'}
+                    onPress={async () => {
+                      await saveConfig({ ...parsed.config, quietHours: { ...parsed.config.quietHours, enabled: !parsed.config.quietHours.enabled } });
+                      context.ui.showToast(`Quiet hours ${parsed.config.quietHours.enabled ? 'disabled' : 'enabled'}`);
+                    }}
+                  >
+                    {parsed.config.quietHours.enabled ? 'ON' : 'OFF'}
+                  </button>
+                </hstack>
+                <hstack gap="small">
+                  {[20, 22, 23].map((h) => (
+                    <button key={`s${h}`} size="small" appearance={parsed.config.quietHours.startHour === h ? 'primary' : 'secondary'}
+                      onPress={async () => { await saveConfig({ ...parsed.config, quietHours: { ...parsed.config.quietHours, startHour: h } }); context.ui.showToast(`Start → ${h}:00`); }}>
+                      {h}:00
+                    </button>
+                  ))}
+                  {[6, 7, 8].map((h) => (
+                    <button key={`e${h}`} size="small" appearance={parsed.config.quietHours.endHour === h ? 'primary' : 'secondary'}
+                      onPress={async () => { await saveConfig({ ...parsed.config, quietHours: { ...parsed.config.quietHours, endHour: h } }); context.ui.showToast(`End → ${h}:00`); }}>
+                      {h}:00
+                    </button>
+                  ))}
+                </hstack>
+                <text size="xsmall" color="neutral-content-weak">Critical alerts still deliver during quiet hours.</text>
+              </vstack>
+            )}
+
           </vstack>
-        </vstack>
-      )}
+        );
+      })()}
 
       {parsed && activeTab === 'danger' && (
-        <vstack gap="medium" padding="medium" grow>
+        <vstack gap="small" padding="small" grow>
           <vstack
             backgroundColor={parsed.killSwitchOn ? '#ff444422' : 'neutral-background'}
-            padding="medium"
+            padding="small"
             cornerRadius="medium"
             gap="small"
           >
@@ -630,8 +675,8 @@ export function renderConfig(context: Context): JSX.Element {
             </button>
           </vstack>
 
-          <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
-            <text weight="bold">Export Config</text>
+          <vstack backgroundColor="neutral-background" padding="small" cornerRadius="medium" gap="small">
+            <text weight="bold" size="small">Export Config</text>
             <text size="small" color="neutral-content-weak">Sends current config as JSON to your mod inbox.</text>
             <button
               size="small"
@@ -649,8 +694,8 @@ export function renderConfig(context: Context): JSX.Element {
             </button>
           </vstack>
 
-          <vstack backgroundColor="neutral-background" padding="medium" cornerRadius="medium" gap="small">
-            <text weight="bold" color="#ff4444">Reset to Default</text>
+          <vstack backgroundColor="neutral-background" padding="small" cornerRadius="medium" gap="small">
+            <text weight="bold" size="small" color="#ff4444">Reset to Default</text>
             <text size="small" color="neutral-content-weak">Resets all settings to the Default preset. Cannot be undone.</text>
             <button
               appearance="destructive"

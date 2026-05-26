@@ -8,13 +8,13 @@ SubGuardian is an automated moderation assistant for Reddit subreddits. It handl
 
 ### Spam Filtering
 
-Every post is scored the moment it's submitted. SubGuardian looks for duplicate titles, duplicate body text, banned keywords, banned domains, links in titles, all-caps words, excessive punctuation, and very new accounts. Each signal adds to a spam score. If the score crosses your flag threshold, the post is removed from the feed and held for mod review. If it crosses your auto-remove threshold, it's removed outright.
+Every post is scored the moment it's submitted. SubGuardian looks for duplicate titles, duplicate body text, banned keywords, banned domains, links in titles, all-caps words, excessive punctuation, and very new accounts. Each signal adds to a spam score. If the score crosses your flag threshold, the post is kept on the feed and held for mod review. If it crosses your auto-remove threshold, it's removed outright.
 
 Users with a high trust score get a discount on their spam score — an established contributor won't be flagged for a borderline keyword.
 
 ### First-Time Offender Recovery
 
-When a user with no prior violations hits the spam threshold for the first time, SubGuardian doesn't hard-remove the post. Instead it holds it, sends the author a PM explaining exactly which signals fired and how to fix them, and opens a 24-hour edit window. The author edits their post and replies `!recheck` to the PM. SubGuardian re-scores the post automatically — if it passes, the post goes live without any mod action needed.
+When a user with no prior violations hits the flag threshold for the first time, SubGuardian doesn't hard-remove the post. Instead it holds it, sends the author a PM explaining exactly which signals fired and how to fix them, and opens a 24-hour edit window. The author edits their post and replies `!recheck` to the PM. SubGuardian re-scores the post automatically — if it passes, the post goes live without any mod action needed.
 
 Posts in the recovery window appear with a **Recovery** badge in the Pending Review queue so mods know not to hard-remove them prematurely.
 

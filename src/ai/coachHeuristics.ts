@@ -337,12 +337,13 @@ function handleExplainTrust(ctx: CoachContext): string {
     '',
     'Scores run 0–1000 and update after every moderation event.',
     '',
-    '  Grace (new user)      First 5 approved posts — lighter scrutiny',
-    '  Untrusted     0–149   Full spam checks, strictest gates',
-    '  Low         150–299   Reduced report weight (0.5×)',
-    '  Neutral     300–499   Normal (1.0× weight)',
-    '  Trusted     500–699   Elevated report weight (1.5×)',
-    '  Highly Trusted 700+   Bypasses ALL raid/strict mode gates',
+    'Trust tiers:',
+    '  Grace (new user)   First 5 approved posts — lighter scrutiny',
+    '  Untrusted   0–149  Full spam checks, strictest gates',
+    '  Low       150–299  Reduced report weight (0.5×)',
+    '  Neutral   300–499  Normal (1.0× weight)',
+    '  Trusted   500–699  Elevated report weight (1.5×)',
+    '  Highly Trusted 700+  Bypasses ALL raid/strict mode gates',
     '',
     'Trust is built by:',
     '  +150 max from account age (1pt per 7.5 days)',
@@ -364,43 +365,46 @@ function handleExplainTrust(ctx: CoachContext): string {
 
 function handleWhatDoFirst(ctx: CoachContext): string {
   const { config } = ctx;
-  const kws = config.spamDetection.bannedKeywords;
+  const kws = config.spamDetection?.bannedKeywords ?? [];
   const items: string[] = [];
   let n = 1;
 
   if (kws.length < 3) {
-    items.push(`${n++}. Add spam keywords — you have only ${kws.length} configured.`);
-    items.push('   Tip: ask "Suggest spam keywords" for data-driven suggestions.');
+    items.push(`${n++}. Add spam keywords — only ${kws.length} configured.`);
+    items.push('   Ask "Suggest spam keywords" for data-driven suggestions.');
   }
-  if (!config.features.antiRaid) {
+  if (!config.features?.antiRaid) {
     items.push(`${n++}. Enable anti-raid mode — currently off.`);
-    items.push('   Start with the Default preset in Config UI → Presets.');
+    items.push('   Config UI → Presets → Apply Default or Strict.');
   }
-  if (!config.flairVoting.minTrustToVote || config.flairVoting.minTrustToVote === 0) {
-    items.push(`${n++}. Set minTrustToVote in Config UI → Thresholds. Most subs use 300.`);
+  if (!config.flairVoting?.minTrustToVote) {
+    items.push(`${n++}. Set minTrustToVote in Config UI → Thresholds. Recommended: 300.`);
   }
-  if (!config.features.flairAutoAssign) {
-    items.push(`${n++}. Enable flair auto-assign — helps organise posts automatically.`);
+  if (!config.features?.flairAutoAssign) {
+    items.push(`${n++}. Enable flair auto-assign — organises posts automatically.`);
   }
-  if (!config.ai.apiKeyConfigured) {
-    items.push(`${n++}. (Optional) Set LLM_API_KEY to unlock open Q&A in Coach.`);
+  if (!config.ai?.apiKeyConfigured) {
+    items.push(`${n++}. (Optional) Set LLM_API_KEY to unlock free-text Q&A in Coach.`);
   }
 
-  if (items.length === 0) {
-    return [
-      `r/${ctx.subredditName} looks well configured.`,
-      '',
-      'Next steps:',
-      '  • Review the audit log for any unexpected actions.',
-      '  • Check the pending review queue for flagged posts.',
-      '  • Monitor the spike detector alerts in modmail.',
-    ].join('\n');
-  }
+  const checklist = [
+    '',
+    'Priority checklist:',
+    ...items.length > 0 ? items : ['  ✓ All key settings look good.'],
+  ];
+
+  const nextSteps = [
+    '',
+    'Suggested next steps:',
+    '  • Review the audit log for unexpected actions.',
+    '  • Check the pending review queue for flagged posts.',
+    `  • Removal rate today: ${ctx.todayStats.posts > 0 ? Math.round((ctx.todayStats.removed / ctx.todayStats.posts) * 100) : 0}% — ${ctx.todayStats.removed} of ${ctx.todayStats.posts} posts removed.`,
+  ];
 
   return [
-    `Setup priority list for r/${ctx.subredditName}:`,
-    '',
-    ...items,
+    `New Mod Guide — r/${ctx.subredditName}`,
+    ...checklist,
+    ...nextSteps,
   ].join('\n');
 }
 

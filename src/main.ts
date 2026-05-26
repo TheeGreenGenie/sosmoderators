@@ -97,7 +97,14 @@ Devvit.addMenuItem({
     const sub = context.subredditName ?? '';
     const oldId = await redis.get('sys:dashboard:post_id');
     if (oldId) {
-      try { await context.reddit.remove(oldId, false); } catch { /* already gone */ }
+      try {
+        const existing = await context.reddit.getPostById(oldId);
+        if (!existing.removed && !existing.spam) {
+          context.ui.navigateTo(existing.url);
+          return;
+        }
+        // Post was removed/deleted — fall through to recreate
+      } catch { /* post not found — fall through to recreate */ }
     }
     const post = await context.reddit.submitPost({
       subredditName: sub,
@@ -106,6 +113,7 @@ Devvit.addMenuItem({
       postData: { view: 'dashboard' },
     });
     await redis.set('sys:dashboard:post_id', post.id);
+    try { await post.sticky(1); } catch { /* sticky slot taken */ }
     context.ui.navigateTo(post.url);
   },
 });
@@ -119,7 +127,14 @@ Devvit.addMenuItem({
     const sub = context.subredditName ?? '';
     const oldId = await redis.get('sys:config:post_id');
     if (oldId) {
-      try { await context.reddit.remove(oldId, false); } catch { /* already gone */ }
+      try {
+        const existing = await context.reddit.getPostById(oldId);
+        if (!existing.removed && !existing.spam) {
+          context.ui.navigateTo(existing.url);
+          return;
+        }
+        // Post was removed/deleted — fall through to recreate
+      } catch { /* post not found — fall through to recreate */ }
     }
     const post = await context.reddit.submitPost({
       subredditName: sub,
@@ -128,6 +143,7 @@ Devvit.addMenuItem({
       postData: { view: 'config' },
     });
     await redis.set('sys:config:post_id', post.id);
+    try { await post.sticky(2); } catch { /* sticky slot taken */ }
     context.ui.navigateTo(post.url);
   },
 });

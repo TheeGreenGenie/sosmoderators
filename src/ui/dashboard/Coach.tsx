@@ -72,7 +72,15 @@ function renderSection(
   if (!section.collapsible) {
     return (
       <vstack key={String(index)}>
-        <text size="small" wrap color={section.header.startsWith('⚠') ? '#ffaa00' : section.header.startsWith('✓') ? '#00aa44' : undefined}>
+        <text
+          size="small"
+          wrap
+          color={
+            section.header.startsWith('⚠') ? '#ffaa00' :
+            section.header.startsWith('✓') ? '#00aa44' :
+            undefined
+          }
+        >
           {section.header}
         </text>
       </vstack>
@@ -81,16 +89,20 @@ function renderSection(
 
   return (
     <vstack key={String(index)} gap="small">
-      <button
-        size="small"
-        appearance="secondary"
-        grow
-        onPress={onToggle}
+      <hstack
+        backgroundColor="neutral-background-selected"
+        padding="small"
+        cornerRadius="small"
+        alignment="start middle"
+        gap="small"
       >
-        {isCollapsed ? '[+] ' : '[-] '}{section.header}
-      </button>
+        <text size="small" weight="bold" wrap grow>{section.header}</text>
+        <button size="small" appearance="secondary" onPress={onToggle}>
+          {isCollapsed ? '+' : '−'}
+        </button>
+      </hstack>
       {!isCollapsed && (
-        <vstack backgroundColor="neutral-background-selected" padding="small" cornerRadius="small">
+        <vstack backgroundColor="neutral-background" padding="small" cornerRadius="small">
           <text size="small" wrap>{section.body}</text>
         </vstack>
       )}
